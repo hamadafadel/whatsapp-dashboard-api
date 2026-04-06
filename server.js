@@ -5,6 +5,7 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 app.use(express.json());
+const clients = new Set();
 
 // 🔥 بيانات قاعدة البيانات (حط بياناتك هنا)
 const pool = new Pool({
@@ -79,6 +80,21 @@ app.get('/health', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  res.flushHeaders?.();
+
+  res.write(`data: ${JSON.stringify({ connected: true })}\n\n`);
+
+  clients.add(res);
+
+  req.on('close', () => {
+    clients.delete(res);
+  });
+});
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
