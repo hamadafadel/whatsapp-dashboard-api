@@ -34,10 +34,13 @@ app.get('/api/conversations', async (req, res) => {
     `);
 
     res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error fetching conversations');
-  }
+ } catch (err) {
+  console.error('Conversations error:', err);
+  res.status(500).json({
+    error: 'Error fetching conversations',
+    details: err.message
+  });
+}
 });
 
 // 🟢 رسائل محادثة واحدة
@@ -60,10 +63,13 @@ app.get('/api/messages/:sessionId', async (req, res) => {
     );
 
     res.json(result.rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error fetching messages');
-  }
+ } catch (err) {
+  console.error('Messages error:', err);
+  res.status(500).json({
+    error: 'Error fetching messages',
+    details: err.message
+  });
+}
 });
 
 // 🟢 تشغيل السيرفر
