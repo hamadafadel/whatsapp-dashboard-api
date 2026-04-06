@@ -108,6 +108,26 @@ app.get('/api/events', (req, res) => {
     clients.delete(res);
   });
 });
+
+app.post('/api/push-update', (req, res) => {
+  const secret = req.headers['x-dashboard-secret'];
+
+  if (secret !== process.env.DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const payload = req.body || {
+    message: 'New update',
+    time: new Date().toISOString()
+  };
+
+  for (const client of clients) {
+    client.write(`data: ${JSON.stringify(payload)}\n\n`);
+  }
+
+  res.json({ sent: true });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
