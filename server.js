@@ -8,11 +8,11 @@ app.use(express.json());
 
 // 🔥 بيانات قاعدة البيانات (حط بياناتك هنا)
 const pool = new Pool({
-  host: 'postgresql',
-  port: 5432,
-  database: 'n8n',
-  user: 'postgres',
-  password: 'II2hY4awfMwBP2AJgVxXsDaFUDUw2fUJotrgkYdHOrv73AZU4UQB6Z4K2WunbNPf',
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 5432),
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
 });
 
 // 🟢 اختبار السيرفر
