@@ -78,6 +78,19 @@ app.get('/health', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
+app.get('/api/test-event', (req, res) => {
+  const payload = {
+    message: 'Hello from server 🔥',
+    time: new Date().toISOString()
+  };
+
+  for (const client of clients) {
+    client.write(`data: ${JSON.stringify(payload)}\n\n`);
+  }
+
+  res.json({ sent: true });
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.get('/api/events', (req, res) => {
