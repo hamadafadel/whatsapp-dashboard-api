@@ -128,6 +128,52 @@ app.post('/api/push-update', (req, res) => {
   res.json({ sent: true });
 });
 
+app.post('/api/send-message', async (req, res) => {
+  try {
+    const { sessionId, message } = req.body;
+
+    if (!sessionId || !message) {
+      return res.status(400).json({
+        error: 'sessionId and message are required'
+      });
+    }
+
+    const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+      },
+      body: JSON.stringify({
+        sessionId,
+        message
+      })
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(500).json({
+        error: 'Failed to send message via n8n',
+        details: data
+      });
+    }
+
+    // ✅ مهم جدًا
+    res.json({
+      success: true,
+      data
+    });
+
+  } catch (err) {
+    console.error('send-message error:', err);
+
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+});
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
