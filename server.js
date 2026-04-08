@@ -25,23 +25,27 @@ app.get('/', (req, res) => {
 app.get('/api/conversations', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT DISTINCT ON (session_id)
-        session_id,
-        message->>'content' AS content,
-        message->>'type' AS type,
-        id
-      FROM chat_memory
-      ORDER BY session_id, id DESC
+      SELECT *
+      FROM (
+        SELECT DISTINCT ON (session_id)
+          session_id,
+          message->>'content' AS content,
+          message->>'type' AS type,
+          id
+        FROM chat_memory
+        ORDER BY session_id, id DESC
+      ) latest
+      ORDER BY id DESC
     `);
 
     res.json(result.rows);
- } catch (err) {
-  console.error('Conversations error:', err);
-  res.status(500).json({
-    error: 'Error fetching conversations',
-    details: err.message
-  });
-}
+  } catch (err) {
+    console.error('Conversations error:', err);
+    res.status(500).json({
+      error: 'Error fetching conversations',
+      details: err.message
+    });
+  }
 });
 
 // 🟢 رسائل محادثة واحدة
