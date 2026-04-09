@@ -5,9 +5,9 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
 const clients = new Set();
 
-// 🔥 بيانات قاعدة البيانات (حط بياناتك هنا)
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: Number(process.env.DB_PORT || 5432),
@@ -16,12 +16,12 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
-// 🟢 اختبار السيرفر
+// اختبار السيرفر
 app.get('/', (req, res) => {
   res.send('API is working 🚀');
 });
 
-// 🟢 كل المحادثات
+// كل المحادثات
 app.get('/api/conversations', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -48,7 +48,7 @@ app.get('/api/conversations', async (req, res) => {
   }
 });
 
-// 🟢 رسائل محادثة واحدة
+// رسائل محادثة واحدة
 app.get('/api/messages/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
 
@@ -68,20 +68,21 @@ app.get('/api/messages/:sessionId', async (req, res) => {
     );
 
     res.json(result.rows);
- } catch (err) {
-  console.error('Messages error:', err);
-  res.status(500).json({
-    error: 'Error fetching messages',
-    details: err.message
-  });
-}
+  } catch (err) {
+    console.error('Messages error:', err);
+    res.status(500).json({
+      error: 'Error fetching messages',
+      details: err.message
+    });
+  }
 });
 
-// 🟢 تشغيل السيرفر
+// Health
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true });
 });
 
+// SSE test
 app.get('/api/test-event', (req, res) => {
   const payload = {
     message: 'Hello from server 🔥',
@@ -95,8 +96,7 @@ app.get('/api/test-event', (req, res) => {
   res.json({ sent: true });
 });
 
-const PORT = process.env.PORT || 3000;
-
+// SSE stream
 app.get('/api/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -113,6 +113,7 @@ app.get('/api/events', (req, res) => {
   });
 });
 
+// Push realtime update
 app.post('/api/push-update', (req, res) => {
   const secret = req.headers['x-dashboard-secret'];
 
@@ -132,6 +133,7 @@ app.post('/api/push-update', (req, res) => {
   res.json({ sent: true });
 });
 
+// إرسال رسالة من الداشبورد
 app.post('/api/send-message', async (req, res) => {
   try {
     const { sessionId, message } = req.body;
@@ -163,12 +165,10 @@ app.post('/api/send-message', async (req, res) => {
       });
     }
 
-    // ✅ مهم جدًا
     res.json({
       success: true,
       data
     });
-
   } catch (err) {
     console.error('send-message error:', err);
 
@@ -178,6 +178,88 @@ app.post('/api/send-message', async (req, res) => {
     });
   }
 });
+
+// جلب حالة AI
+app.get('/api/ai-status/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT ai_enabled
+      FROM chat_sessions
+      WHERE session_id = $1
+      `,
+      [sessionId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.json({
+        sessionId,
+        ai_enabled: true
+      });
+    }
+
+    res.json({
+      sessionId,
+      ai_enabled: result.rows[0].ai_enabled
+    });
+  } catch (err) {
+    console.error('ai-status error:', err);
+    res.status(500).json({
+      error: 'Error fetching AI status',
+      details: err.message
+    });
+  }
+});
+
+// تغيير حالة AI
+app.post('/api/ai-status', async (req, res) => {
+  const { sessionId, ai_enabled } = req.body;
+
+  if (!sessionId || typeof ai_enabled !== 'boolean') {
+    return res.status(400).json({
+      error: 'sessionId and ai_enabled are required'
+    });
+  }
+
+  try {
+    await pool.query(
+      `
+      INSERT INTO chat_sessions (session_id, ai_enabled)
+      VALUES ($1, $2)
+      ON CONFLICT (session_id)
+      DO UPDATE SET ai_enabled = EXCLUDED.ai_enabled
+      `,
+      [sessionId, ai_enabled]
+    );
+
+    const payload = {
+      type: 'ai_status_changed',
+      sessionId,
+      ai_enabled
+    };
+
+    for (const client of clients) {
+      client.write(`data: ${JSON.stringify(payload)}\n\n`);
+    }
+
+    res.json({
+      success: true,
+      sessionId,
+      ai_enabled
+    });
+  } catch (err) {
+    console.error('ai-status update error:', err);
+    res.status(500).json({
+      error: 'Error updating AI status',
+      details: err.message
+    });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
