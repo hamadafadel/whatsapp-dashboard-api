@@ -56,13 +56,15 @@ app.get('/api/messages/:sessionId', async (req, res) => {
     const result = await pool.query(
       `
       SELECT
-        id,
-        session_id,
-        message->>'type' AS type,
-        message->>'content' AS content
-      FROM chat_memory
-      WHERE session_id = $1
-      ORDER BY id ASC
+  id,
+  session_id,
+  message,
+  message->>'type' AS type,
+  message->>'content' AS content,
+  message->>'message_kind' AS message_kind
+FROM chat_memory
+WHERE session_id = $1
+ORDER BY id ASC
       `,
       [sessionId]
     );
