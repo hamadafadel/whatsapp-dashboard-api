@@ -9,6 +9,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(__dirname));
+app.get('/debug-files', (req, res) => {
+  res.json({
+    dir: __dirname,
+    files: fs.readdirSync(__dirname)
+  });
+});
+
+app.get('/mobile.html', (req, res) => {
+  const filePath = path.join(__dirname, 'mobile.html');
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send('mobile.html not found in container');
+  }
+
+  res.sendFile(filePath);
+});
+
 const clients = new Set();
 
 const pool = new Pool({
