@@ -65,18 +65,19 @@ app.get('/', (req, res) => {
 app.get('/api/conversations', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT *
-      FROM (
-        SELECT DISTINCT ON (session_id)
-          session_id,
-          message->>'content' AS content,
-          message->>'type' AS type,
-          id
-        FROM chat_memory
-        ORDER BY session_id, id DESC
-      ) latest
-      ORDER BY id DESC
-    `);
+  SELECT *
+  FROM (
+    SELECT DISTINCT ON (session_id)
+      session_id,
+      message->>'content' AS content,
+      message->>'type' AS type,
+      message->>'customer_name' AS customer_name,
+      id
+    FROM chat_memory
+    ORDER BY session_id, id DESC
+  ) latest
+  ORDER BY id DESC
+`);
 
     res.json(result.rows);
   } catch (err) {
