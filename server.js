@@ -300,6 +300,25 @@ app.post('/api/ai-status', async (req, res) => {
   }
 });
 
+app.post('/api/upload-media', upload.single('file'), (req, res) => {
+  const secret = req.headers['x-dashboard-secret'];
+
+  if (secret !== process.env.DASHBOARD_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'file is required' });
+  }
+
+  const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+  res.json({
+    success: true,
+    url: fileUrl,
+    filename: req.file.filename
+  });
+});
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
