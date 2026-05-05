@@ -17,6 +17,18 @@ if (!fs.existsSync(uploadsDir)) {
 }
 
 app.use('/uploads', express.static(uploadsDir));
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadsDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueName = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    const ext = path.extname(file.originalname) || '.jpg';
+    cb(null, uniqueName + ext);
+  }
+});
+
+const upload = multer({ storage });
 app.get('/debug-files', (req, res) => {
   res.json({
     dir: __dirname,
