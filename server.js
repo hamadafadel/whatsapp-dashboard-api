@@ -92,22 +92,28 @@ app.get('/api/conversations', async (req, res) => {
 // رسائل محادثة واحدة
 app.get('/api/messages/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
+  const limit = Math.min(Number(req.query.limit || 50), 200);
 
   try {
     const result = await pool.query(
       `
-      SELECT
-  id,
-  session_id,
-  message,
-  message->>'type' AS type,
-  message->>'content' AS content,
-  message->>'message_kind' AS message_kind
-FROM chat_memory
-WHERE session_id = $1
-ORDER BY id ASC
+      SELECT *
+      FROM (
+        SELECT
+          id,
+          session_id,
+          message,
+          message->>'type' AS type,
+          message->>'content' AS content,
+          message->>'message_kind' AS message_kind
+        FROM chat_memory
+        WHERE session_id = $1
+        ORDER BY id DESC
+        LIMIT $2
+      ) latest
+      ORDER BY id ASC
       `,
-      [sessionId]
+      [sessionId, limit]
     );
 
     res.json(result.rows);
