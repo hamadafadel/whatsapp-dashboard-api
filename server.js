@@ -198,7 +198,7 @@ app.post('/api/push-update', (req, res) => {
 // إرسال رسالة من الداشبورد
 app.post('/api/send-message', async (req, res) => {
   try {
-    const { sessionId, message } = req.body;
+    const { sessionId, message, replyTo } = req.body;
 
     if (!sessionId || !message) {
       return res.status(400).json({
@@ -213,9 +213,10 @@ app.post('/api/send-message', async (req, res) => {
         'x-api-key': process.env.INTERNAL_API_TOKEN || ''
       },
       body: JSON.stringify({
-        sessionId,
-        message
-      })
+  sessionId,
+  message,
+  replyTo
+})
     });
 
     const data = await response.json().catch(() => ({}));
