@@ -31,6 +31,26 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage });
+const DASHBOARD_USERNAME = process.env.DASHBOARD_USERNAME || 'admin';
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '123456';
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+function requireAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : null;
+
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
 app.get('/debug-files', (req, res) => {
   res.json({
     dir: __dirname,
@@ -63,8 +83,44 @@ app.get('/', (req, res) => {
   res.send('API is working 🚀');
 });
 
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+
+    if (
+      username !== DASHBOARD_USERNAME ||
+      password !== DASHBOARD_PASSWORD
+    ) {
+      return res.status(401).json({
+        error: 'Invalid credentials'
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        username
+      },
+      JWT_SECRET,
+      {
+        expiresIn: '30d'
+      }
+    );
+
+    res.json({
+      success: true,
+      token
+    });
+
+  } catch (err) {
+    console.error('login error:', err);
+
+    res.status(500).json({
+      error: 'Login failed'
+    });
+  }
+});
 // كل المحادثات
-app.get('/api/conversations', async (req, res) => {
+app.get('/api/conversations', requireAuth, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT
@@ -105,7 +161,7 @@ app.get('/api/conversations', async (req, res) => {
 });
 
 // رسائل محادثة واحدة
-app.get('/api/messages/:sessionId', async (req, res) => {
+app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
   const { sessionId } = req.params;
   const limit = Math.min(Number(req.query.limit || 50), 200);
 
@@ -161,7 +217,7 @@ app.get('/api/test-event', (req, res) => {
 });
 
 // SSE stream
-app.get('/api/events', (req, res) => {
+app.get('/api/events', requireAuth, (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -198,7 +254,7 @@ app.post('/api/push-update', (req, res) => {
 });
 
 // إرسال رسالة من الداشبورد
-app.post('/api/send-message', async (req, res) => {
+app.post('/api/send-message', requireAuth, async (req, res) => {
   try {
     const { sessionId, message, replyTo } = req.body;
 
@@ -245,7 +301,7 @@ app.post('/api/send-message', async (req, res) => {
 });
 
 // جلب حالة AI
-app.get('/api/ai-status/:sessionId', async (req, res) => {
+app.get('/api/ai-status/:sessionId', requireAuth, async (req, res) => {
   const { sessionId } = req.params;
 
   try {
@@ -279,7 +335,7 @@ app.get('/api/ai-status/:sessionId', async (req, res) => {
 });
 
 // تغيير حالة AI
-app.post('/api/ai-status', async (req, res) => {
+app.post('/api/ai-status', requireAuth, async (req, res) => {
   const { sessionId, ai_enabled } = req.body;
 
   if (!sessionId || typeof ai_enabled !== 'boolean') {
