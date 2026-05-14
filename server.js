@@ -36,9 +36,11 @@ const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '123456';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7)
-    : null;
+
+  const token =
+    authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : req.query.token || null;
 
   if (!token) {
     return res.status(401).json({ error: 'Unauthorized' });
