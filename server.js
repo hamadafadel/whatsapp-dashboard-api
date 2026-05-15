@@ -400,6 +400,56 @@ app.post('/api/upload-media', upload.single('file'), (req, res) => {
     filename: req.file.filename
   });
 });
+app.post('/api/send-media', upload.single('file'), async (req, res) => {
+  try {
+    const { sessionId, caption = '', messageKind = 'image' } = req.body;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'file is required' });
+    }
+
+    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+    const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+      },
+      body: JSON.stringify({
+        sessionId,
+        message: caption,
+        messageKind,
+        mediaUrl: fileUrl
+      })
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(500).json({
+        error: 'Failed to send media via n8n',
+        details: data
+      });
+    }
+
+    res.json({
+      success: true,
+      url: fileUrl,
+      data
+    });
+  } catch (err) {
+    console.error('send-media error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+});
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
