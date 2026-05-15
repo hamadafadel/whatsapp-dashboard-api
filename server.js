@@ -392,7 +392,7 @@ app.post('/api/upload-media', upload.single('file'), (req, res) => {
     return res.status(400).json({ error: 'file is required' });
   }
 
-  const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+  const fileUrl = `https://${req.get('host')}/uploads/${req.file.filename}`;
 
   res.json({
     success: true,
@@ -412,7 +412,7 @@ app.post('/api/send-media', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'file is required' });
     }
 
-    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+    const fileUrl = `https://${req.get('host')}/uploads/${req.file.filename}`;
 
     const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
       method: 'POST',
