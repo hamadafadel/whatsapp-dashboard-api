@@ -316,12 +316,20 @@ app.post('/api/send-message', requireAuth, async (req, res) => {
 }
 
 if (messageKind === "reaction") {
-  if (!messageId || !emoji) {
+  if (!messageId) {
     return res.status(400).json({
-      error: 'messageId and emoji are required for reaction'
+      error: "messageId is required for reaction"
     });
   }
-} else if (!message) {
+
+  // emoji مسموح تكون فاضية لإزالة الريأكت
+  if (typeof emoji !== "string") {
+    return res.status(400).json({
+      error: "emoji must be a string"
+    });
+  }
+}
+else if (!message) {
   return res.status(400).json({
     error: 'message is required'
   });
