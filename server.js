@@ -258,7 +258,14 @@ app.post('/api/push-update', (req, res) => {
 // إرسال رسالة من الداشبورد
 app.post('/api/send-message', requireAuth, async (req, res) => {
   try {
-    const { sessionId, message, replyTo } = req.body;
+    const {
+  sessionId,
+  message,
+  replyTo,
+  messageKind = "text",
+  messageId = "",
+  emoji = ""
+} = req.body;
 
     if (!sessionId || !message) {
       return res.status(400).json({
@@ -275,7 +282,10 @@ app.post('/api/send-message', requireAuth, async (req, res) => {
       body: JSON.stringify({
   sessionId,
   message,
-  replyTo
+  replyTo,
+  messageKind,
+  messageId,
+  emoji
 })
     });
 
