@@ -267,11 +267,23 @@ app.post('/api/send-message', requireAuth, async (req, res) => {
   emoji = ""
 } = req.body;
 
-    if (!sessionId || !message) {
-      return res.status(400).json({
-        error: 'sessionId and message are required'
-      });
-    }
+    if (!sessionId) {
+  return res.status(400).json({
+    error: 'sessionId is required'
+  });
+}
+
+if (messageKind === "reaction") {
+  if (!messageId || !emoji) {
+    return res.status(400).json({
+      error: 'messageId and emoji are required for reaction'
+    });
+  }
+} else if (!message) {
+  return res.status(400).json({
+    error: 'message is required'
+  });
+}
 
     const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
       method: 'POST',
