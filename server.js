@@ -24,10 +24,52 @@ const storage = multer.diskStorage({
     cb(null, uploadsDir);
   },
   filename: function (req, file, cb) {
-    const uniqueName = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, uniqueName + ext);
-  }
+  const uniqueName =
+    Date.now() + "-" + Math.round(Math.random() * 1e9);
+
+  const originalExt = path.extname(file.originalname || "").toLowerCase();
+
+  const mimeType = String(file.mimetype || "")
+    .toLowerCase()
+    .split(";")[0]
+    .trim();
+
+  const extensionByMime = {
+    // Audio
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/amr": ".amr",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+
+    // Images
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+
+    // Videos
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/3gpp": ".3gp",
+    "video/webm": ".webm",
+
+    // Documents
+    "application/pdf": ".pdf"
+  };
+
+  const ext =
+    extensionByMime[mimeType] ||
+    originalExt ||
+    ".bin";
+
+  cb(null, uniqueName + ext);
+}
 });
 
 const upload = multer({ storage });
