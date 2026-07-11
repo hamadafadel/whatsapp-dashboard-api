@@ -14,7 +14,44 @@ const execFileAsync = promisify(execFile);
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(__dirname));
+// منع تخزين ملفات واجهة الداشبورد القديمة
+app.use((req, res, next) => {
+  const noCacheFiles = [
+    "/",
+    "/index.html",
+    "/app.js",
+    "/app.css",
+    "/service-worker.js",
+    "/manifest.json"
+  ];
+
+  const pathname = String(req.path || "");
+
+  if (
+    noCacheFiles.includes(pathname) ||
+    pathname.endsWith("/app.js") ||
+    pathname.endsWith("/app.css")
+  ) {
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate, proxy-revalidate"
+    );
+
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Surrogate-Control", "no-store");
+  }
+
+  next();
+});
+
+app.use(
+  express.static(__dirname, {
+    etag: false,
+    lastModified: false,
+    maxAge: 0
+  })
+);
 const uploadsDir = path.join(__dirname, 'uploads');
 
 if (!fs.existsSync(uploadsDir)) {
