@@ -476,38 +476,106 @@ app.post('/api/upload-media', upload.single('file'), (req, res) => {
   });
 });
 app.post('/api/send-media', upload.single('file'), async (req, res) => {
+  let originalFilePath = null;
+  let finalFilePath = null;
+
   try {
-    const { sessionId, caption = '', messageKind = 'image' } = req.body;
+    const {
+      sessionId,
+      caption = "",
+      messageKind = "image"
+    } = req.body;
 
     if (!sessionId) {
-      return res.status(400).json({ error: 'sessionId is required' });
+      return res.status(400).json({
+        error: "sessionId is required"
+      });
     }
 
     if (!req.file) {
-      return res.status(400).json({ error: 'file is required' });
+      return res.status(400).json({
+        error: "file is required"
+      });
     }
 
-    const fileUrl = `https://${req.get('host')}/uploads/${req.file.filename}`;
+    originalFilePath = req.file.path;
+    finalFilePath = originalFilePath;
 
-    const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.INTERNAL_API_TOKEN || ''
-      },
-      body: JSON.stringify({
-        sessionId,
-        message: caption,
-        messageKind,
-        mediaUrl: fileUrl
-      })
-    });
+    let finalFileName = req.file.filename;
 
-    const data = await response.json().catch(() => ({}));
+    // تحويل تسجيل المتصفح إلى OGG/Opus المتوافق مع واتساب
+    if (messageKind === "audio") {
+      const parsedName = path.parse(req.file.filename);
+
+      finalFileName = `${parsedName.name}-converted.ogg`;
+      finalFilePath = path.join(
+        uploadsDir,
+        finalFileName
+      );
+
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-i",
+        originalFilePath,
+
+        "-vn",
+
+        "-c:a",
+        "libopus",
+
+        "-b:a",
+        "32k",
+
+        "-application",
+        "voip",
+
+        "-ar",
+        "48000",
+
+        "-ac",
+        "1",
+
+        finalFilePath
+      ]);
+
+      // حذف النسخة الأصلية بعد نجاح التحويل
+      if (
+        originalFilePath !== finalFilePath &&
+        fs.existsSync(originalFilePath)
+      ) {
+        fs.unlinkSync(originalFilePath);
+      }
+    }
+
+    const fileUrl =
+      `https://${req.get("host")}/uploads/${finalFileName}`;
+
+    const response = await fetch(
+      process.env.N8N_SEND_WEBHOOK_URL,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key":
+            process.env.INTERNAL_API_TOKEN || ""
+        },
+
+        body: JSON.stringify({
+          sessionId,
+          message: caption,
+          messageKind,
+          mediaUrl: fileUrl
+        })
+      }
+    );
+
+    const data =
+      await response.json().catch(() => ({}));
 
     if (!response.ok) {
       return res.status(500).json({
-        error: 'Failed to send media via n8n',
+        error: "Failed to send media via n8n",
         details: data
       });
     }
@@ -515,12 +583,31 @@ app.post('/api/send-media', upload.single('file'), async (req, res) => {
     res.json({
       success: true,
       url: fileUrl,
+      messageKind,
       data
     });
+
   } catch (err) {
-    console.error('send-media error:', err);
+    console.error("send-media error:", err);
+
+    // حذف الملف المحوّل غير المكتمل إن وُجد
+    if (
+      finalFilePath &&
+      finalFilePath !== originalFilePath &&
+      fs.existsSync(finalFilePath)
+    ) {
+      try {
+        fs.unlinkSync(finalFilePath);
+      } catch (cleanupError) {
+        console.error(
+          "Failed to remove converted audio:",
+          cleanupError
+        );
+      }
+    }
+
     res.status(500).json({
-      error: 'Internal server error',
+      error: "Internal server error",
       details: err.message
     });
   }
