@@ -7,6 +7,7 @@ const cors = require('cors');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const webpush = require('web-push');
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 
@@ -162,6 +163,16 @@ const DASHBOARD_AGENT1_PASSWORD =
   process.env.DASHBOARD_AGENT1_PASSWORD || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:admin@almehrab.org';
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn('VAPID keys not set — push notifications are disabled.');
+}
+
 function findDashboardAccount(username, password) {
   const accounts = [
     {
@@ -287,6 +298,61 @@ ensureSavedMediaTables().catch((err) => {
   console.error('Failed to ensure saved_media tables:', err);
 });
 
+async function ensurePushSubscriptionsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id SERIAL PRIMARY KEY,
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      created_by TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+ensurePushSubscriptionsTable().catch((err) => {
+  console.error('Failed to ensure push_subscriptions table:', err);
+});
+
+// عمود تتبع آخر رسالة اتقرت في كل محادثة، عشان نحسب منه عدد الرسايل الجديدة
+async function ensureUnreadTrackingColumn() {
+  await pool.query(`
+    ALTER TABLE chat_sessions
+    ADD COLUMN IF NOT EXISTS last_read_message_id BIGINT NOT NULL DEFAULT 0
+  `);
+}
+
+ensureUnreadTrackingColumn().catch((err) => {
+  console.error('Failed to ensure last_read_message_id column:', err);
+});
+
+async function ensureLabelsTables() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversation_labels (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      color TEXT NOT NULL DEFAULT '#54105b',
+      created_by TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversation_label_assignments (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      label_id INTEGER NOT NULL REFERENCES conversation_labels(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(session_id, label_id)
+    )
+  `);
+}
+
+ensureLabelsTables().catch((err) => {
+  console.error('Failed to ensure labels tables:', err);
+});
+
 async function stampLatestAgentMessage(
   sessionId,
   agentName,
@@ -390,7 +456,9 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         latest.content,
         latest.type,
         names.customer_name,
-        latest.id
+        latest.id,
+        COALESCE(unread.unread_count, 0) AS unread_count,
+        COALESCE(labels_agg.labels, '[]') AS labels
       FROM (
         SELECT DISTINCT ON (session_id)
           session_id,
@@ -409,6 +477,25 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         ORDER BY session_id, id DESC
       ) names
       ON latest.session_id = names.session_id
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS unread_count
+        FROM chat_memory cm
+        WHERE cm.session_id = latest.session_id
+          AND cm.message->>'type' = 'user'
+          AND cm.id > COALESCE(
+            (SELECT cs.last_read_message_id FROM chat_sessions cs WHERE cs.session_id = latest.session_id),
+            0
+          )
+      ) unread ON true
+      LEFT JOIN LATERAL (
+        SELECT json_agg(
+          json_build_object('id', cl.id, 'name', cl.name, 'color', cl.color)
+          ORDER BY cl.id
+        ) AS labels
+        FROM conversation_label_assignments cla
+        JOIN conversation_labels cl ON cl.id = cla.label_id
+        WHERE cla.session_id = latest.session_id
+      ) labels_agg ON true
       ORDER BY latest.id DESC
     `);
 
@@ -643,8 +730,405 @@ app.post('/api/push-update', (req, res) => {
     client.write(`data: ${JSON.stringify(payload)}\n\n`);
   }
 
+  if (payload.type === 'user_message' && payload.sessionId) {
+    sendNewMessagePush(payload.sessionId, payload).catch((err) => {
+      console.error('push notification error:', err);
+    });
+  }
+
   res.json({ sent: true });
 });
+
+async function getCustomerNameForSession(sessionId) {
+  try {
+    const result = await pool.query(
+      `SELECT message->>'customer_name' AS customer_name
+       FROM chat_memory
+       WHERE session_id = $1 AND COALESCE(message->>'customer_name', '') <> ''
+       ORDER BY id DESC
+       LIMIT 1`,
+      [sessionId]
+    );
+
+    return result.rows[0]?.customer_name || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+async function sendPushToAllSubscriptions(payload) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+
+  const result = await pool.query(
+    'SELECT id, endpoint, p256dh, auth FROM push_subscriptions'
+  );
+  const body = JSON.stringify(payload);
+
+  await Promise.all(
+    result.rows.map(async (row) => {
+      try {
+        await webpush.sendNotification(
+          {
+            endpoint: row.endpoint,
+            keys: { p256dh: row.p256dh, auth: row.auth }
+          },
+          body
+        );
+      } catch (err) {
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          await pool
+            .query('DELETE FROM push_subscriptions WHERE id = $1', [row.id])
+            .catch(() => {});
+        } else {
+          console.error('push send error:', err.message);
+        }
+      }
+    })
+  );
+}
+
+async function sendNewMessagePush(sessionId, payload) {
+  const customerName = (await getCustomerNameForSession(sessionId)) || 'عميل';
+  const body = String(
+    payload.content || payload.message || '📩 رسالة جديدة'
+  ).slice(0, 120);
+
+  await sendPushToAllSubscriptions({
+    title: customerName,
+    body,
+    sessionId,
+    url: '/'
+  });
+}
+
+// مفتاح VAPID العام عشان الواجهة تشترك في الإشعارات
+app.get('/api/push/public-key', requireAuth, (req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.post('/api/push-subscribe', requireAuth, async (req, res) => {
+  try {
+    const { endpoint, keys } = req.body || {};
+
+    if (!endpoint || !keys?.p256dh || !keys?.auth) {
+      return res.status(400).json({ error: 'Invalid subscription' });
+    }
+
+    const createdBy = req.user?.username || '';
+
+    await pool.query(
+      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_by)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (endpoint)
+       DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`,
+      [endpoint, keys.p256dh, keys.auth, createdBy]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('push-subscribe error:', err);
+    res.status(500).json({
+      error: 'Error saving push subscription',
+      details: err.message
+    });
+  }
+});
+
+app.post('/api/push-unsubscribe', requireAuth, async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+
+    if (!endpoint) {
+      return res.status(400).json({ error: 'endpoint is required' });
+    }
+
+    await pool.query('DELETE FROM push_subscriptions WHERE endpoint = $1', [
+      endpoint
+    ]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('push-unsubscribe error:', err);
+    res.status(500).json({
+      error: 'Error removing push subscription',
+      details: err.message
+    });
+  }
+});
+
+// تحديد المحادثة كمقروءة، ويصفّر عداد الرسايل الجديدة لأي جهاز فاتح الداشبورد
+app.post(
+  '/api/conversations/:sessionId/mark-read',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+
+      if (!sessionId) {
+        return res.status(400).json({ error: 'sessionId is required' });
+      }
+
+      const latest = await pool.query(
+        `SELECT COALESCE(MAX(id), 0)::bigint AS max_id
+         FROM chat_memory
+         WHERE session_id = $1`,
+        [sessionId]
+      );
+
+      const maxId = latest.rows[0]?.max_id || 0;
+
+      await pool.query(
+        `INSERT INTO chat_sessions (session_id, last_read_message_id)
+         VALUES ($1, $2)
+         ON CONFLICT (session_id)
+         DO UPDATE SET last_read_message_id = GREATEST(
+           chat_sessions.last_read_message_id, EXCLUDED.last_read_message_id
+         )`,
+        [sessionId, maxId]
+      );
+
+      const payload = {
+        type: 'unread_changed',
+        sessionId,
+        unreadCount: 0
+      };
+
+      for (const client of clients) {
+        client.write(`data: ${JSON.stringify(payload)}\n\n`);
+      }
+
+      res.json({ success: true, sessionId });
+    } catch (err) {
+      console.error('mark-read error:', err);
+      res.status(500).json({
+        error: 'Error marking conversation as read',
+        details: err.message
+      });
+    }
+  }
+);
+
+function broadcastLabelChanged(sessionId) {
+  const payload = { type: 'label_changed', sessionId: sessionId || null };
+
+  for (const client of clients) {
+    client.write(`data: ${JSON.stringify(payload)}\n\n`);
+  }
+}
+
+// كل الليبلز المتاحة (كل الأدوار تقدر تشوفها عشان تلزّق أي ليبل على أي محادثة)
+app.get('/api/labels', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, color FROM conversation_labels ORDER BY id ASC`
+    );
+
+    res.json({
+      labels: result.rows,
+      canManage: req.user?.role === 'admin'
+    });
+  } catch (err) {
+    console.error('labels list error:', err);
+    res.status(500).json({
+      error: 'Error fetching labels',
+      details: err.message
+    });
+  }
+});
+
+// إنشاء ليبل جديد (أدمن فقط)
+app.post('/api/labels', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    const color = String(req.body?.color || '#54105b').trim();
+
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    const createdBy = req.user?.username || '';
+
+    const result = await pool.query(
+      `INSERT INTO conversation_labels (name, color, created_by)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, color`,
+      [name, color, createdBy]
+    );
+
+    broadcastLabelChanged(null);
+
+    res.json({ success: true, label: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'الاسم ده مستخدم بالفعل' });
+    }
+
+    console.error('labels create error:', err);
+    res.status(500).json({
+      error: 'Error creating label',
+      details: err.message
+    });
+  }
+});
+
+// تعديل ليبل (أدمن فقط)
+app.put('/api/labels/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const name = String(req.body?.name || '').trim();
+    const color = String(req.body?.color || '#54105b').trim();
+
+    if (!id || !name) {
+      return res.status(400).json({
+        error: 'Valid id and name are required'
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE conversation_labels SET name = $1, color = $2 WHERE id = $3
+       RETURNING id, name, color`,
+      [name, color, id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Label not found' });
+    }
+
+    broadcastLabelChanged(null);
+
+    res.json({ success: true, label: result.rows[0] });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'الاسم ده مستخدم بالفعل' });
+    }
+
+    console.error('labels update error:', err);
+    res.status(500).json({
+      error: 'Error updating label',
+      details: err.message
+    });
+  }
+});
+
+// حذف ليبل (أدمن فقط) — بيتشال تلقائيًا من كل المحادثات اللي حاطاه
+app.delete('/api/labels/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+
+    if (!id) {
+      return res.status(400).json({ error: 'Valid id is required' });
+    }
+
+    const result = await pool.query(
+      `DELETE FROM conversation_labels WHERE id = $1 RETURNING id`,
+      [id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Label not found' });
+    }
+
+    broadcastLabelChanged(null);
+
+    res.json({ success: true, id });
+  } catch (err) {
+    console.error('labels delete error:', err);
+    res.status(500).json({
+      error: 'Error deleting label',
+      details: err.message
+    });
+  }
+});
+
+// ليبلز محادثة معيّنة
+app.get(
+  '/api/conversations/:sessionId/labels',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+
+      const result = await pool.query(
+        `SELECT cl.id, cl.name, cl.color
+         FROM conversation_label_assignments cla
+         JOIN conversation_labels cl ON cl.id = cla.label_id
+         WHERE cla.session_id = $1
+         ORDER BY cl.id ASC`,
+        [sessionId]
+      );
+
+      res.json({ labels: result.rows });
+    } catch (err) {
+      console.error('conversation labels list error:', err);
+      res.status(500).json({
+        error: 'Error fetching conversation labels',
+        details: err.message
+      });
+    }
+  }
+);
+
+// إضافة ليبل لمحادثة (أدمن أو إيجنت)
+app.post(
+  '/api/conversations/:sessionId/labels',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      const labelId = Number(req.body?.labelId);
+
+      if (!sessionId || !labelId) {
+        return res.status(400).json({
+          error: 'Valid sessionId and labelId are required'
+        });
+      }
+
+      await pool.query(
+        `INSERT INTO conversation_label_assignments (session_id, label_id)
+         VALUES ($1, $2)
+         ON CONFLICT (session_id, label_id) DO NOTHING`,
+        [sessionId, labelId]
+      );
+
+      broadcastLabelChanged(sessionId);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('conversation label attach error:', err);
+      res.status(500).json({
+        error: 'Error attaching label',
+        details: err.message
+      });
+    }
+  }
+);
+
+// إزالة ليبل من محادثة (أدمن أو إيجنت)
+app.delete(
+  '/api/conversations/:sessionId/labels/:labelId',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const { sessionId, labelId } = req.params;
+
+      await pool.query(
+        `DELETE FROM conversation_label_assignments
+         WHERE session_id = $1 AND label_id = $2`,
+        [sessionId, Number(labelId)]
+      );
+
+      broadcastLabelChanged(sessionId);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('conversation label detach error:', err);
+      res.status(500).json({
+        error: 'Error detaching label',
+        details: err.message
+      });
+    }
+  }
+);
 
 // إرسال رسالة من الداشبورد
 app.post('/api/send-message', requireAuth, async (req, res) => {
