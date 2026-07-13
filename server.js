@@ -321,10 +321,15 @@ async function ensureUnreadTrackingColumn() {
     ALTER TABLE chat_sessions
     ADD COLUMN IF NOT EXISTS last_read_message_id BIGINT NOT NULL DEFAULT 0
   `);
+
+  await pool.query(`
+    ALTER TABLE chat_sessions
+    ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT false
+  `);
 }
 
 ensureUnreadTrackingColumn().catch((err) => {
-  console.error('Failed to ensure last_read_message_id column:', err);
+  console.error('Failed to ensure last_read_message_id/hidden columns:', err);
 });
 
 async function ensureLabelsTables() {
@@ -357,37 +362,75 @@ async function stampLatestAgentMessage(
   sessionId,
   agentName,
   messageKind = 'text',
-  messageLocator = ''
+  messageLocator = '',
+  replyTo = null
 ) {
   if (!sessionId || !agentName) return;
 
+  // لو الرسالة دي رد على رسالة تانية، بنثبّت الـ reply_to على نفس السطر
+  // عشان يفضل ظاهر بعد أي إعادة تحميل، حتى لو الـ n8n نفسه ما بيحفظوش
+  const hasReplyTo = Boolean(replyTo && replyTo.content);
+
   await pool.query(
-    `
-    WITH target AS (
-      SELECT id
-      FROM chat_memory
-      WHERE session_id = $1
-        AND message->>'type' = 'agent'
-        AND COALESCE(message->>'message_kind', 'text') = $3
-        AND (
-          $4 = ''
-          OR message->>'media_url' = $4
-          OR message->>'content' = $4
+    hasReplyTo
+      ? `
+        WITH target AS (
+          SELECT id
+          FROM chat_memory
+          WHERE session_id = $1
+            AND message->>'type' = 'agent'
+            AND COALESCE(message->>'message_kind', 'text') = $3
+            AND (
+              $4 = ''
+              OR message->>'media_url' = $4
+              OR message->>'content' = $4
+            )
+          ORDER BY id DESC
+          LIMIT 1
         )
-      ORDER BY id DESC
-      LIMIT 1
-    )
-    UPDATE chat_memory AS cm
-    SET message = jsonb_set(
-      cm.message,
-      '{agent_name}',
-      to_jsonb($2::text),
-      true
-    )
-    FROM target
-    WHERE cm.id = target.id
-    `,
-    [sessionId, agentName, messageKind, messageLocator]
+        UPDATE chat_memory AS cm
+        SET message = jsonb_set(
+          jsonb_set(
+            cm.message,
+            '{agent_name}',
+            to_jsonb($2::text),
+            true
+          ),
+          '{reply_to}',
+          $5::jsonb,
+          true
+        )
+        FROM target
+        WHERE cm.id = target.id
+        `
+      : `
+        WITH target AS (
+          SELECT id
+          FROM chat_memory
+          WHERE session_id = $1
+            AND message->>'type' = 'agent'
+            AND COALESCE(message->>'message_kind', 'text') = $3
+            AND (
+              $4 = ''
+              OR message->>'media_url' = $4
+              OR message->>'content' = $4
+            )
+          ORDER BY id DESC
+          LIMIT 1
+        )
+        UPDATE chat_memory AS cm
+        SET message = jsonb_set(
+          cm.message,
+          '{agent_name}',
+          to_jsonb($2::text),
+          true
+        )
+        FROM target
+        WHERE cm.id = target.id
+        `,
+    hasReplyTo
+      ? [sessionId, agentName, messageKind, messageLocator, JSON.stringify(replyTo)]
+      : [sessionId, agentName, messageKind, messageLocator]
   );
 
   const payload = {
@@ -450,7 +493,12 @@ app.post('/api/login', async (req, res) => {
 // كل المحادثات
 app.get('/api/conversations', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(`
+    const wantHidden = ['1', 'true'].includes(
+      String(req.query.hidden || '').toLowerCase()
+    );
+
+    const result = await pool.query(
+      `
       SELECT
         latest.session_id,
         latest.content,
@@ -458,7 +506,8 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         names.customer_name,
         latest.id,
         COALESCE(unread.unread_count, 0) AS unread_count,
-        COALESCE(labels_agg.labels, '[]') AS labels
+        COALESCE(labels_agg.labels, '[]') AS labels,
+        COALESCE(sess.hidden, false) AS hidden
       FROM (
         SELECT DISTINCT ON (session_id)
           session_id,
@@ -496,8 +545,12 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         JOIN conversation_labels cl ON cl.id = cla.label_id
         WHERE cla.session_id = latest.session_id
       ) labels_agg ON true
+      LEFT JOIN chat_sessions sess ON sess.session_id = latest.session_id
+      WHERE COALESCE(sess.hidden, false) = $1
       ORDER BY latest.id DESC
-    `);
+      `,
+      [wantHidden]
+    );
 
     res.json(result.rows);
   } catch (err) {
@@ -1029,6 +1082,115 @@ app.post(
   }
 );
 
+function broadcastConversationsChanged() {
+  const payload = { type: 'conversations_changed' };
+
+  for (const client of clients) {
+    client.write(`data: ${JSON.stringify(payload)}\n\n`);
+  }
+}
+
+function parseSessionIds(body) {
+  const ids = Array.isArray(body?.sessionIds) ? body.sessionIds : [];
+  return ids.map((id) => String(id || '').trim()).filter(Boolean);
+}
+
+// إخفاء مجموعة محادثات من القايمة الرئيسية
+app.post('/api/conversations/hide', requireAuth, async (req, res) => {
+  try {
+    const sessionIds = parseSessionIds(req.body);
+    if (!sessionIds.length) {
+      return res.status(400).json({ error: 'sessionIds is required' });
+    }
+
+    await pool.query(
+      `INSERT INTO chat_sessions (session_id, hidden)
+       SELECT unnest($1::text[]), true
+       ON CONFLICT (session_id)
+       DO UPDATE SET hidden = true`,
+      [sessionIds]
+    );
+
+    broadcastConversationsChanged();
+    res.json({ success: true, count: sessionIds.length });
+  } catch (err) {
+    console.error('conversations/hide error:', err);
+    res.status(500).json({
+      error: 'Error hiding conversations',
+      details: err.message
+    });
+  }
+});
+
+// إظهار مجموعة محادثات كانت مخفية
+app.post('/api/conversations/unhide', requireAuth, async (req, res) => {
+  try {
+    const sessionIds = parseSessionIds(req.body);
+    if (!sessionIds.length) {
+      return res.status(400).json({ error: 'sessionIds is required' });
+    }
+
+    await pool.query(
+      `UPDATE chat_sessions SET hidden = false
+       WHERE session_id = ANY($1::text[])`,
+      [sessionIds]
+    );
+
+    broadcastConversationsChanged();
+    res.json({ success: true, count: sessionIds.length });
+  } catch (err) {
+    console.error('conversations/unhide error:', err);
+    res.status(500).json({
+      error: 'Error unhiding conversations',
+      details: err.message
+    });
+  }
+});
+
+// تحديد مجموعة محادثات محددة كمقروءة دفعة واحدة
+app.post(
+  '/api/conversations/mark-read-batch',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const sessionIds = parseSessionIds(req.body);
+      if (!sessionIds.length) {
+        return res.status(400).json({ error: 'sessionIds is required' });
+      }
+
+      await pool.query(
+        `
+        INSERT INTO chat_sessions (session_id, last_read_message_id)
+        SELECT cm.session_id, MAX(cm.id)
+        FROM chat_memory cm
+        WHERE cm.session_id = ANY($1::text[])
+        GROUP BY cm.session_id
+        ON CONFLICT (session_id)
+        DO UPDATE SET last_read_message_id = GREATEST(
+          chat_sessions.last_read_message_id, EXCLUDED.last_read_message_id
+        )
+        `,
+        [sessionIds]
+      );
+
+      for (const sessionId of sessionIds) {
+        const payload = { type: 'unread_changed', sessionId, unreadCount: 0 };
+        for (const client of clients) {
+          client.write(`data: ${JSON.stringify(payload)}\n\n`);
+        }
+      }
+
+      res.json({ success: true, count: sessionIds.length });
+    } catch (err) {
+      console.error('mark-read-batch error:', err);
+      res.status(500).json({
+        error: 'Error marking conversations as read',
+        details: err.message
+      });
+    }
+  }
+);
+
 function broadcastLabelChanged(sessionId) {
   const payload = { type: 'label_changed', sessionId: sessionId || null };
 
@@ -1224,6 +1386,40 @@ app.post(
   }
 );
 
+// إضافة ليبل لمجموعة محادثات دفعة واحدة (أدمن أو إيجنت)
+app.post(
+  '/api/labels/:labelId/assign-batch',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const labelId = Number(req.params.labelId);
+      const sessionIds = parseSessionIds(req.body);
+
+      if (!labelId || !sessionIds.length) {
+        return res.status(400).json({
+          error: 'Valid labelId and sessionIds are required'
+        });
+      }
+
+      await pool.query(
+        `INSERT INTO conversation_label_assignments (session_id, label_id)
+         SELECT unnest($1::text[]), $2
+         ON CONFLICT (session_id, label_id) DO NOTHING`,
+        [sessionIds, labelId]
+      );
+
+      broadcastLabelChanged(null);
+      res.json({ success: true, count: sessionIds.length });
+    } catch (err) {
+      console.error('label assign-batch error:', err);
+      res.status(500).json({
+        error: 'Error assigning label',
+        details: err.message
+      });
+    }
+  }
+);
+
 // إزالة ليبل من محادثة (أدمن أو إيجنت)
 app.delete(
   '/api/conversations/:sessionId/labels/:labelId',
@@ -1321,12 +1517,17 @@ else if (!message) {
     }
 
     if (messageKind !== 'reaction') {
-      await stampLatestAgentMessage(
+      // من غير await قصدًا: تثبيت اسم المرسل والرد المقتبس مش لازم المستخدم
+      // ينتظره، وده كان بياخد جولة Postgres إضافية قبل ما الرد يرجع للداشبورد
+      stampLatestAgentMessage(
         sessionId,
         agentName,
         messageKind || 'text',
-        message || ''
-      );
+        message || '',
+        replyTo
+      ).catch((err) => {
+        console.error('stampLatestAgentMessage error:', err);
+      });
     }
 
     res.json({
