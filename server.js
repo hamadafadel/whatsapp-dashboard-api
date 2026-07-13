@@ -497,6 +497,10 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
       String(req.query.hidden || '').toLowerCase()
     );
 
+    if (wantHidden && req.user?.role !== 'admin') {
+      return res.status(403).json({ error: 'Admins only' });
+    }
+
     const result = await pool.query(
       `
       SELECT
@@ -823,24 +827,48 @@ async function getCustomerNameForSession(sessionId) {
   }
 }
 
-async function sendPushToAllSubscriptions(payload) {
+async function isConversationHidden(sessionId) {
+  try {
+    const result = await pool.query(
+      `SELECT hidden FROM chat_sessions WHERE session_id = $1`,
+      [sessionId]
+    );
+
+    return Boolean(result.rows[0]?.hidden);
+  } catch (err) {
+    return false;
+  }
+}
+
+async function sendPushToAllSubscriptions(payload, options = {}) {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
     console.warn('sendPushToAllSubscriptions: VAPID keys missing, skipping');
     return;
   }
 
   const result = await pool.query(
-    'SELECT id, endpoint, p256dh, auth FROM push_subscriptions'
+    'SELECT id, endpoint, p256dh, auth, created_by FROM push_subscriptions'
   );
 
+  let rows = result.rows;
+
+  // محادثة مخفية: الإيجنت متعرفش أصلاً إنها موجودة، فمش المفروض يتبعتله إشعار عنها
+  if (options.adminOnly) {
+    const before = rows.length;
+    rows = rows.filter((row) => row.created_by === DASHBOARD_USERNAME);
+    console.log(
+      `sendPushToAllSubscriptions: hidden conversation, restricting to admin subscriptions (${rows.length}/${before})`
+    );
+  }
+
   console.log(
-    `sendPushToAllSubscriptions: found ${result.rows.length} subscription(s)`
+    `sendPushToAllSubscriptions: sending to ${rows.length} subscription(s)`
   );
 
   const body = JSON.stringify(payload);
 
   await Promise.all(
-    result.rows.map(async (row) => {
+    rows.map(async (row) => {
       try {
         await webpush.sendNotification(
           {
@@ -889,15 +917,19 @@ function buildPushBodyText(payload) {
 async function sendNewMessagePush(sessionId, payload) {
   console.log(`sendNewMessagePush: triggered for session ${sessionId}`);
 
+  const hidden = await isConversationHidden(sessionId);
   const customerName = (await getCustomerNameForSession(sessionId)) || 'عميل';
   const body = buildPushBodyText(payload);
 
-  await sendPushToAllSubscriptions({
-    title: customerName,
-    body,
-    sessionId,
-    url: '/'
-  });
+  await sendPushToAllSubscriptions(
+    {
+      title: customerName,
+      body,
+      sessionId,
+      url: '/'
+    },
+    { adminOnly: hidden }
+  );
 }
 
 // مفتاح VAPID العام عشان الواجهة تشترك في الإشعارات
@@ -1096,7 +1128,7 @@ function parseSessionIds(body) {
 }
 
 // إخفاء مجموعة محادثات من القايمة الرئيسية
-app.post('/api/conversations/hide', requireAuth, async (req, res) => {
+app.post('/api/conversations/hide', requireAuth, requireAdmin, async (req, res) => {
   try {
     const sessionIds = parseSessionIds(req.body);
     if (!sessionIds.length) {
@@ -1123,7 +1155,7 @@ app.post('/api/conversations/hide', requireAuth, async (req, res) => {
 });
 
 // إظهار مجموعة محادثات كانت مخفية
-app.post('/api/conversations/unhide', requireAuth, async (req, res) => {
+app.post('/api/conversations/unhide', requireAuth, requireAdmin, async (req, res) => {
   try {
     const sessionIds = parseSessionIds(req.body);
     if (!sessionIds.length) {
