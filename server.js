@@ -1452,6 +1452,39 @@ app.post(
   }
 );
 
+// إزالة ليبل من مجموعة محادثات دفعة واحدة (أدمن أو إيجنت)
+app.post(
+  '/api/labels/:labelId/unassign-batch',
+  requireAuth,
+  async (req, res) => {
+    try {
+      const labelId = Number(req.params.labelId);
+      const sessionIds = parseSessionIds(req.body);
+
+      if (!labelId || !sessionIds.length) {
+        return res.status(400).json({
+          error: 'Valid labelId and sessionIds are required'
+        });
+      }
+
+      await pool.query(
+        `DELETE FROM conversation_label_assignments
+         WHERE label_id = $1 AND session_id = ANY($2::text[])`,
+        [labelId, sessionIds]
+      );
+
+      broadcastLabelChanged(null);
+      res.json({ success: true, count: sessionIds.length });
+    } catch (err) {
+      console.error('label unassign-batch error:', err);
+      res.status(500).json({
+        error: 'Error removing label',
+        details: err.message
+      });
+    }
+  }
+);
+
 // إزالة ليبل من محادثة (أدمن أو إيجنت)
 app.delete(
   '/api/conversations/:sessionId/labels/:labelId',
