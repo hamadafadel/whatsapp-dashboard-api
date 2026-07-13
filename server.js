@@ -731,16 +731,22 @@ app.post('/api/push-update', (req, res) => {
   }
 
   console.log(
-    `push-update received: type=${payload.type} sessionId=${payload.sessionId}`
+    `push-update received: type=${payload.type} messageType=${payload.messageType} sessionId=${payload.sessionId}`
   );
 
-  if (payload.type === 'user_message' && payload.sessionId) {
+  // رسالة عميل جديدة فعلية: n8n بيبعتها كـ type=new_message مع messageType=user
+  // (مش user_message زي ما كنا مفترضين قبل كده — ده كان سبب عدم ظهور الإشعارات خالص)
+  if (
+    payload.type === 'new_message' &&
+    payload.sessionId &&
+    payload.messageType === 'user'
+  ) {
     sendNewMessagePush(payload.sessionId, payload).catch((err) => {
       console.error('push notification error:', err);
     });
   } else {
     console.log(
-      'push-update: not a user_message with sessionId, skipping push'
+      'push-update: not a new customer message, skipping push'
     );
   }
 
@@ -809,13 +815,29 @@ async function sendPushToAllSubscriptions(payload) {
   );
 }
 
+function buildPushBodyText(payload) {
+  if (payload.content && payload.content !== '__image__') {
+    return String(payload.content).slice(0, 120);
+  }
+
+  const kind = String(
+    payload.messageKind || payload.message_kind || ''
+  ).toLowerCase();
+
+  if (kind === 'image') return '📷 صورة';
+  if (kind === 'video') return '🎥 فيديو';
+  if (kind === 'audio') return '🎙️ رسالة صوتية';
+  if (kind === 'document') return '📄 ملف';
+  if (kind === 'sticker') return '🖼️ ملصق';
+
+  return String(payload.message || '📩 رسالة جديدة').slice(0, 120);
+}
+
 async function sendNewMessagePush(sessionId, payload) {
   console.log(`sendNewMessagePush: triggered for session ${sessionId}`);
 
   const customerName = (await getCustomerNameForSession(sessionId)) || 'عميل';
-  const body = String(
-    payload.content || payload.message || '📩 رسالة جديدة'
-  ).slice(0, 120);
+  const body = buildPushBodyText(payload);
 
   await sendPushToAllSubscriptions({
     title: customerName,
