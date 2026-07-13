@@ -730,10 +730,18 @@ app.post('/api/push-update', (req, res) => {
     client.write(`data: ${JSON.stringify(payload)}\n\n`);
   }
 
+  console.log(
+    `push-update received: type=${payload.type} sessionId=${payload.sessionId}`
+  );
+
   if (payload.type === 'user_message' && payload.sessionId) {
     sendNewMessagePush(payload.sessionId, payload).catch((err) => {
       console.error('push notification error:', err);
     });
+  } else {
+    console.log(
+      'push-update: not a user_message with sessionId, skipping push'
+    );
   }
 
   res.json({ sent: true });
@@ -757,11 +765,19 @@ async function getCustomerNameForSession(sessionId) {
 }
 
 async function sendPushToAllSubscriptions(payload) {
-  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return;
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    console.warn('sendPushToAllSubscriptions: VAPID keys missing, skipping');
+    return;
+  }
 
   const result = await pool.query(
     'SELECT id, endpoint, p256dh, auth FROM push_subscriptions'
   );
+
+  console.log(
+    `sendPushToAllSubscriptions: found ${result.rows.length} subscription(s)`
+  );
+
   const body = JSON.stringify(payload);
 
   await Promise.all(
@@ -774,13 +790,19 @@ async function sendPushToAllSubscriptions(payload) {
           },
           body
         );
+        console.log(`push send OK -> subscription #${row.id}`);
       } catch (err) {
         if (err.statusCode === 404 || err.statusCode === 410) {
+          console.warn(
+            `push subscription #${row.id} expired (status ${err.statusCode}), removing`
+          );
           await pool
             .query('DELETE FROM push_subscriptions WHERE id = $1', [row.id])
             .catch(() => {});
         } else {
-          console.error('push send error:', err.message);
+          console.error(
+            `push send error -> subscription #${row.id}: status=${err.statusCode} message=${err.message}`
+          );
         }
       }
     })
@@ -788,6 +810,8 @@ async function sendPushToAllSubscriptions(payload) {
 }
 
 async function sendNewMessagePush(sessionId, payload) {
+  console.log(`sendNewMessagePush: triggered for session ${sessionId}`);
+
   const customerName = (await getCustomerNameForSession(sessionId)) || 'عميل';
   const body = String(
     payload.content || payload.message || '📩 رسالة جديدة'
@@ -806,6 +830,39 @@ app.get('/api/push/public-key', requireAuth, (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
 });
 
+// تشخيص سريع: كام جهاز مشترك فعليًا في الإشعارات دلوقتي
+app.get('/api/push/debug', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, created_by, created_at, endpoint
+       FROM push_subscriptions
+       ORDER BY id DESC`
+    );
+
+    res.json({
+      vapidConfigured: Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY),
+      count: result.rows.length,
+      subscriptions: result.rows.map((row) => {
+        let host = 'invalid-endpoint';
+        try {
+          host = new URL(row.endpoint).host;
+        } catch (e) {
+          // ignore
+        }
+
+        return {
+          id: row.id,
+          created_by: row.created_by,
+          created_at: row.created_at,
+          push_service: host
+        };
+      })
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/push-subscribe', requireAuth, async (req, res) => {
   try {
     const { endpoint, keys } = req.body || {};
@@ -822,6 +879,12 @@ app.post('/api/push-subscribe', requireAuth, async (req, res) => {
        ON CONFLICT (endpoint)
        DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`,
       [endpoint, keys.p256dh, keys.auth, createdBy]
+    );
+
+    console.log(
+      `push-subscribe: saved subscription for ${createdBy || 'unknown user'} (endpoint host: ${
+        new URL(endpoint).host
+      })`
     );
 
     res.json({ success: true });
