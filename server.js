@@ -1091,6 +1091,13 @@ function deleteMediaFilesBestEffort(filePath) {
 }
 
 async function sendSavedMediaToSession(item, sessionId, agentName, caption = '') {
+  // بدون نص ثابت هنا، بعض ورش n8n بتحاول تولّد كابشن تلقائي من محتوى
+  // الصورة نفسها (زي OCR)، وده اللي كان بيظهر كنص غريب تحت آخر رسالة
+  // في قايمة المحادثات. النص الثابت ده بيمنع أي توليد تلقائي.
+  const outgoingMessage =
+    caption ||
+    (item.media_kind === 'video' ? '🎥 فيديو' : '📷 صورة');
+
   const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
     method: 'POST',
     headers: {
@@ -1099,7 +1106,7 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     },
     body: JSON.stringify({
       sessionId,
-      message: caption,
+      message: outgoingMessage,
       messageKind: item.media_kind,
       mediaUrl: item.media_url,
       thumbnailUrl: item.thumbnail_url || '',
