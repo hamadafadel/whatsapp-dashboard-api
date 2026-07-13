@@ -908,6 +908,42 @@ app.post(
   }
 );
 
+// تحديد كل المحادثات كمقروءة دفعة واحدة
+app.post(
+  '/api/conversations/mark-all-read',
+  requireAuth,
+  async (req, res) => {
+    try {
+      await pool.query(`
+        INSERT INTO chat_sessions (session_id, last_read_message_id)
+        SELECT session_id, MAX(id) FROM chat_memory GROUP BY session_id
+        ON CONFLICT (session_id)
+        DO UPDATE SET last_read_message_id = GREATEST(
+          chat_sessions.last_read_message_id, EXCLUDED.last_read_message_id
+        )
+      `);
+
+      const payload = {
+        type: 'unread_changed',
+        sessionId: null,
+        all: true
+      };
+
+      for (const client of clients) {
+        client.write(`data: ${JSON.stringify(payload)}\n\n`);
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error('mark-all-read error:', err);
+      res.status(500).json({
+        error: 'Error marking all conversations as read',
+        details: err.message
+      });
+    }
+  }
+);
+
 function broadcastLabelChanged(sessionId) {
   const payload = { type: 'label_changed', sessionId: sessionId || null };
 
