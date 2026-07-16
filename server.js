@@ -1703,7 +1703,7 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
 const WHATSAPP_TEMPLATES = {
   followup: {
     label: 'متابعة',
-    templateName: 'followup',
+    templateName: 'after_24h',
     language: 'ar'
   }
 };
