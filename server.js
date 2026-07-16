@@ -2036,7 +2036,28 @@ function deleteMediaFilesBestEffort(filePath) {
   }
 }
 
+// حدود واتساب الرسمية للوسائط: الصورة 5MB والفيديو 16MB. لو تعديت الحد،
+// واتساب بيقبل طلب الإرسال لكن بيفشل يجيب الملف من اللينك بعد كدة بصمت،
+// فالرسالة بتظهر "متبعتة" في الداشبورد بس ما توصلش للعميل.
+const WHATSAPP_MEDIA_LIMITS = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024 };
+
 async function sendSavedMediaToSession(item, sessionId, agentName, caption = '') {
+  const sizeLimit = WHATSAPP_MEDIA_LIMITS[item.media_kind];
+
+  if (sizeLimit && item.file_path) {
+    try {
+      const stat = fs.statSync(item.file_path);
+
+      if (stat.size > sizeLimit) {
+        throw new Error(
+          `حجم ${item.media_kind === 'video' ? 'الفيديو' : 'الصورة'} أكبر من الحد المسموح به في واتساب (${Math.round(sizeLimit / (1024 * 1024))}MB) — احذف الملف ده وارفعه تاني بحجم أصغر`
+        );
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+  }
+
   // بدون نص ثابت هنا، بعض ورش n8n بتحاول تولّد كابشن تلقائي من محتوى
   // الصورة نفسها (زي OCR)، وده اللي كان بيظهر كنص غريب تحت آخر رسالة
   // في قايمة المحادثات. النص الثابت ده بيمنع أي توليد تلقائي.
@@ -2350,7 +2371,7 @@ app.post('/api/saved-media-items/:id/send', requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, media_kind, media_url, thumbnail_url
+      `SELECT id, media_kind, media_url, thumbnail_url, file_path
        FROM saved_media_items WHERE id = $1`,
       [id]
     );
@@ -2394,7 +2415,7 @@ app.post('/api/saved-media-items/send-batch', requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, media_kind, media_url, thumbnail_url
+      `SELECT id, media_kind, media_url, thumbnail_url, file_path
        FROM saved_media_items
        WHERE id = ANY($1::int[])
        ORDER BY id ASC`,
@@ -2409,7 +2430,7 @@ app.post('/api/saved-media-items/send-batch', requireAuth, async (req, res) => {
       req.user?.displayName || req.user?.username || 'Agent';
 
     let sent = 0;
-    let failed = 0;
+    const failReasons = [];
 
     for (const item of result.rows) {
       try {
@@ -2417,14 +2438,15 @@ app.post('/api/saved-media-items/send-batch', requireAuth, async (req, res) => {
         sent++;
       } catch (err) {
         console.error('batch send item failed:', err);
-        failed++;
+        failReasons.push(err.message || 'فشل الإرسال');
       }
     }
 
     res.json({
       success: true,
       sent,
-      failed,
+      failed: failReasons.length,
+      failReasons,
       total: result.rows.length
     });
   } catch (err) {
@@ -2449,7 +2471,7 @@ app.post('/api/saved-media-folders/:id/send', requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, media_kind, media_url, thumbnail_url
+      `SELECT id, media_kind, media_url, thumbnail_url, file_path
        FROM saved_media_items
        WHERE folder_id = $1
        ORDER BY id ASC`,
@@ -2464,7 +2486,7 @@ app.post('/api/saved-media-folders/:id/send', requireAuth, async (req, res) => {
       req.user?.displayName || req.user?.username || 'Agent';
 
     let sent = 0;
-    let failed = 0;
+    const failReasons = [];
 
     for (const item of result.rows) {
       try {
@@ -2472,14 +2494,15 @@ app.post('/api/saved-media-folders/:id/send', requireAuth, async (req, res) => {
         sent++;
       } catch (err) {
         console.error('bulk send item failed:', err);
-        failed++;
+        failReasons.push(err.message || 'فشل الإرسال');
       }
     }
 
     res.json({
       success: true,
       sent,
-      failed,
+      failed: failReasons.length,
+      failReasons,
       total: result.rows.length
     });
   } catch (err) {
