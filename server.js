@@ -1616,6 +1616,20 @@ const DASHBOARD_ACTIONS = {
   regular: 'عادي'
 };
 
+// وقت آخر رسالة من العميل نفسه (نوعها user أو human حسب مين خزّنها)،
+// مستخدم للتحقق من نافذة الـ 24 ساعة قبل السماح بأي مسار تلقائي بيبعت
+// نص حر بدل تيمبليت معتمد
+async function getLastCustomerMessageTime(sessionId) {
+  const result = await pool.query(
+    `SELECT created_at FROM chat_memory
+     WHERE session_id = $1 AND message->>'type' IN ('user', 'human')
+     ORDER BY id DESC LIMIT 1`,
+    [sessionId]
+  );
+
+  return result.rows[0]?.created_at || null;
+}
+
 app.post('/api/dashboard-action', requireAuth, async (req, res) => {
   try {
     const { sessionId, actionId } = req.body || {};
@@ -1625,6 +1639,19 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
       return res.status(400).json({
         error: 'Valid sessionId and actionId are required'
       });
+    }
+
+    const lastCustomerMessageAt = await getLastCustomerMessageTime(sessionId);
+
+    if (lastCustomerMessageAt) {
+      const hoursPassed =
+        (Date.now() - new Date(lastCustomerMessageAt).getTime()) / (1000 * 60 * 60);
+
+      if (hoursPassed >= 24) {
+        return res.status(400).json({
+          error: 'مرّ أكثر من 24 ساعة على آخر رسالة من العميل — لازم تبعت تيمبليت بدل المسار التلقائي'
+        });
+      }
     }
 
     const agentName =
