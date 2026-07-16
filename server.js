@@ -2256,6 +2256,20 @@ app.post(
       const mimeType = String(req.file.mimetype || '');
       const mediaKind = mimeType.startsWith('video/') ? 'video' : 'image';
 
+      // حدود واتساب الرسمية للوسائط: الصورة 5MB والفيديو 16MB. لو تعديت
+      // الحد، واتساب بيقبل طلب الإرسال لكن بيفشل يجيب الملف من اللينك بعد
+      // كدة بصمت، فالرسالة بتظهر "متبعتة" في الداشبورد بس ما توصلش للعميل.
+      const WHATSAPP_MEDIA_LIMITS = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024 };
+      const sizeLimit = WHATSAPP_MEDIA_LIMITS[mediaKind];
+
+      if (sizeLimit && req.file.size > sizeLimit) {
+        fs.unlink(req.file.path, () => {});
+
+        return res.status(400).json({
+          error: `حجم ${mediaKind === 'video' ? 'الفيديو' : 'الصورة'} أكبر من الحد المسموح به في واتساب (${Math.round(sizeLimit / (1024 * 1024))}MB). قلل الحجم وحاول تاني.`
+        });
+      }
+
       const fileUrl = `https://${req.get('host')}/uploads/${req.file.filename}`;
       let thumbnailUrl = '';
 
