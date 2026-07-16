@@ -1671,6 +1671,81 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
   }
 });
 
+// تيمبليتات الواتس المعتمدة (بره فترة الـ 24 ساعة). templateName/language لازم
+// تطابق بالظبط اسم التيمبليت المسجّل ومعتمد في WhatsApp Business Manager
+const WHATSAPP_TEMPLATES = {
+  followup: {
+    label: 'متابعة',
+    templateName: 'followup',
+    language: 'ar'
+  }
+};
+
+app.get('/api/templates', requireAuth, (req, res) => {
+  const templates = Object.entries(WHATSAPP_TEMPLATES).map(
+    ([id, template]) => ({ id, label: template.label })
+  );
+
+  res.json({ templates });
+});
+
+app.post('/api/send-template', requireAuth, async (req, res) => {
+  try {
+    const { sessionId, templateId } = req.body || {};
+    const template = WHATSAPP_TEMPLATES[templateId];
+
+    if (!sessionId || !template) {
+      return res.status(400).json({
+        error: 'Valid sessionId and templateId are required'
+      });
+    }
+
+    const agentName =
+      req.user?.displayName ||
+      req.user?.username ||
+      'Agent';
+
+    const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+      },
+      body: JSON.stringify({
+        sessionId,
+        messageKind: 'dashboard_action',
+        actionId: 'send_template',
+        actionLabel: template.label,
+        templateId,
+        templateName: template.templateName,
+        templateLanguage: template.language,
+        agentName
+      })
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: 'Failed to send template via n8n',
+        details: data
+      });
+    }
+
+    res.json({
+      success: true,
+      templateId,
+      data
+    });
+  } catch (err) {
+    console.error('send-template error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+});
+
 // جلب حالة AI
 app.get('/api/ai-status/:sessionId', requireAuth, async (req, res) => {
   const { sessionId } = req.params;
