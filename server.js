@@ -252,7 +252,7 @@ function requireAdmin(req, res, next) {
 }
 
 function requireGallery(req, res, next) {
-  if (req.user?.role !== 'gallery') {
+  if (req.user?.role !== 'gallery' && req.user?.role !== 'admin') {
     return res.status(403).json({ error: 'Gallery access only' });
   }
 
@@ -2854,12 +2854,42 @@ async function proxyGalleryBinary(req, res, payload) {
   }
 }
 
-// كل الفولدرات الفرعية من الفولدر الرئيسي
-app.get('/api/gallery/folders', requireAuth, requireGallery, (req, res) => {
-  proxyGalleryJson(req, res, {
-    action: 'list_folders',
-    rootFolderId: GALLERY_ROOT_FOLDER_ID
-  });
+// كل الفولدرات الفرعية من الفولدر الرئيسي + فولدر رفعيات content_team1
+// (اللي ممكن يكون برّه الفولدر الرئيسي تمامًا في درايف، فمش هيظهر مع نتائج
+// البحث العادية — بنضيفه يدويًا هنا كعنصر ثابت بدل ما نلمس ورك فلو n8n)
+app.get('/api/gallery/folders', requireAuth, requireGallery, async (req, res) => {
+  try {
+    const response = await callGalleryWebhook({
+      action: 'list_folders',
+      rootFolderId: GALLERY_ROOT_FOLDER_ID
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: data.error || 'Gallery request failed in n8n'
+      });
+    }
+
+    const folders = Array.isArray(data.folders) ? data.folders : [];
+
+    if (
+      GALLERY_UPLOAD_FOLDER_ID &&
+      GALLERY_UPLOAD_FOLDER_ID !== GALLERY_ROOT_FOLDER_ID &&
+      !folders.some((f) => f.id === GALLERY_UPLOAD_FOLDER_ID)
+    ) {
+      folders.push({ id: GALLERY_UPLOAD_FOLDER_ID, name: '📤 رفعياتي' });
+    }
+
+    res.json({ folders });
+  } catch (err) {
+    console.error('gallery folders error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
 });
 
 // محتويات فولدر معين
