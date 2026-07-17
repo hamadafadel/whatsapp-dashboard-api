@@ -2964,7 +2964,10 @@ app.post('/api/gallery/download-zip', requireAuth, requireGallery, (req, res) =>
   });
 });
 
-// رفع ملف جديد في فولدر content_team1 الخاص بيه بس
+// رفع ملف جديد. لو الطلب حدد targetFolderId (الفولدر المفتوح حاليًا في
+// الداشبورد) بيترفع هناك، وإلا بيترفع في فولدر content_team1 الافتراضي.
+// الحماية من إن content_team1 يرفع برّه فولدره بتبقى من واجهة الداشبورد
+// نفسها (الزرار مش بيظهر إلا جوه فولدره)، مش تحقق إضافي هنا.
 app.post(
   '/api/gallery/upload',
   requireAuth,
@@ -2976,9 +2979,13 @@ app.post(
         return res.status(400).json({ error: 'file is required' });
       }
 
+      const targetFolderId =
+        String(req.body?.targetFolderId || '').trim() ||
+        GALLERY_UPLOAD_FOLDER_ID;
+
       const formData = new FormData();
       formData.append('action', 'upload_file');
-      formData.append('targetFolderId', GALLERY_UPLOAD_FOLDER_ID);
+      formData.append('targetFolderId', targetFolderId);
       formData.append('uploadedBy', req.user?.username || 'content_team1');
       formData.append(
         'file',
@@ -3012,6 +3019,50 @@ app.post(
     }
   }
 );
+
+// إنشاء فولدر جديد جوه الفولدر الرئيسي أو جوه أي فولدر تاني
+async function createGalleryFolder(req, res, defaultParentFolderId) {
+  try {
+    const name = String(req.body?.name || '').trim();
+
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    const parentFolderId =
+      String(req.body?.parentFolderId || '').trim() || defaultParentFolderId;
+
+    const response = await callGalleryWebhook({
+      action: 'create_folder',
+      parentFolderId,
+      name
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: data.error || 'Failed to create folder via n8n'
+      });
+    }
+
+    res.json({ success: true, folder: data.folder || data });
+  } catch (err) {
+    console.error('gallery create folder error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+}
+
+app.post('/api/gallery/browse/folders', requireAuth, requireGallery, (req, res) => {
+  createGalleryFolder(req, res, GALLERY_ROOT_FOLDER_ID);
+});
+
+app.post('/api/gallery/browse/:folderId/folders', requireAuth, requireGallery, (req, res) => {
+  createGalleryFolder(req, res, req.params.folderId);
+});
 
 // حذف ملف (الواجهة بتظهر زرار الحذف بس جوه فولدر content_team1 نفسه)
 app.delete('/api/gallery/items/:fileId', requireAuth, requireGallery, async (req, res) => {
