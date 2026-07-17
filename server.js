@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const { Readable } = require('stream');
 
 const express = require('express');
 const { Pool } = require('pg');
@@ -155,13 +156,28 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage });
+const uploadMemory = multer({ storage: multer.memoryStorage() });
 const DASHBOARD_USERNAME = process.env.DASHBOARD_USERNAME || 'admin';
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '123456';
 const DASHBOARD_AGENT1_USERNAME =
   process.env.DASHBOARD_AGENT1_USERNAME || '';
 const DASHBOARD_AGENT1_PASSWORD =
   process.env.DASHBOARD_AGENT1_PASSWORD || '';
+const DASHBOARD_GALLERY_USERNAME =
+  process.env.DASHBOARD_GALLERY_USERNAME || '';
+const DASHBOARD_GALLERY_PASSWORD =
+  process.env.DASHBOARD_GALLERY_PASSWORD || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+
+// فولدر جوجل درايف الرئيسي لمعرض الصور، وفولدر رفعيات content_team1 الخاص بيه
+const GALLERY_ROOT_FOLDER_ID =
+  process.env.GALLERY_ROOT_FOLDER_ID || '1YWEZuUiJfHsqHEjrHX-XV36inomkRoAc';
+
+// الفولدر الفرعي المخصص لرفعيات content_team1 بس — لازم يتعمل يدويًا في
+// درايف جوه الفولدر الرئيسي وتتحط الـ ID بتاعته هنا، عشان رفعياته تتحفظ
+// في مكان ثابت ومعروف بدل ما ندور عليه أو ننشئه ديناميكيًا كل مرة
+const GALLERY_UPLOAD_FOLDER_ID =
+  process.env.GALLERY_UPLOAD_FOLDER_ID || GALLERY_ROOT_FOLDER_ID;
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
@@ -189,6 +205,15 @@ function findDashboardAccount(username, password) {
       password: DASHBOARD_AGENT1_PASSWORD,
       role: 'agent',
       displayName: 'Agent1'
+    });
+  }
+
+  if (DASHBOARD_GALLERY_USERNAME && DASHBOARD_GALLERY_PASSWORD) {
+    accounts.push({
+      username: DASHBOARD_GALLERY_USERNAME,
+      password: DASHBOARD_GALLERY_PASSWORD,
+      role: 'gallery',
+      displayName: 'Content Team'
     });
   }
 
@@ -221,6 +246,14 @@ function requireAuth(req, res, next) {
 function requireAdmin(req, res, next) {
   if (req.user?.role !== 'admin') {
     return res.status(403).json({ error: 'Admins only' });
+  }
+
+  next();
+}
+
+function requireGallery(req, res, next) {
+  if (req.user?.role !== 'gallery') {
+    return res.status(403).json({ error: 'Gallery access only' });
   }
 
   next();
@@ -2751,6 +2784,180 @@ app.post(
     });
   }
 });
+// ============ معرض جوجل درايف (content_team1) ============
+// كل التخزين الفعلي في جوجل درايف — n8n هو الجسر الوحيد اللي بيتكلم مع
+// درايف، والسيرفر بس بيمرر (proxy) الطلبات والملفات من غير ما يخزن حاجة
+// عندنا، عدا رفعية عابرة في الذاكرة وقت الرفع بس.
+
+async function callGalleryWebhook(payload) {
+  const response = await fetch(process.env.N8N_GALLERY_WEBHOOK_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+    },
+    body: JSON.stringify(payload)
+  });
+
+  return response;
+}
+
+// بيمرر رد n8n (JSON) للمتصفح زي ما هو
+async function proxyGalleryJson(req, res, payload) {
+  try {
+    const response = await callGalleryWebhook(payload);
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: data.error || 'Gallery request failed in n8n'
+      });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('gallery proxy error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+}
+
+// بيمرر رد n8n (ملف بيناري) للمتصفح كـ stream من غير ما يتخزن على السيرفر
+async function proxyGalleryBinary(req, res, payload) {
+  try {
+    const response = await callGalleryWebhook(payload);
+
+    if (!response.ok || !response.body) {
+      const data = await response.json().catch(() => ({}));
+      return res.status(502).json({
+        error: data.error || 'Gallery file request failed in n8n'
+      });
+    }
+
+    const contentType = response.headers.get('content-type');
+    const contentDisposition = response.headers.get('content-disposition');
+
+    if (contentType) res.setHeader('Content-Type', contentType);
+    if (contentDisposition) {
+      res.setHeader('Content-Disposition', contentDisposition);
+    }
+
+    Readable.fromWeb(response.body).pipe(res);
+  } catch (err) {
+    console.error('gallery binary proxy error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+}
+
+// كل الفولدرات الفرعية من الفولدر الرئيسي
+app.get('/api/gallery/folders', requireAuth, requireGallery, (req, res) => {
+  proxyGalleryJson(req, res, {
+    action: 'list_folders',
+    rootFolderId: GALLERY_ROOT_FOLDER_ID
+  });
+});
+
+// محتويات فولدر معين
+app.get(
+  '/api/gallery/folders/:folderId/items',
+  requireAuth,
+  requireGallery,
+  (req, res) => {
+    proxyGalleryJson(req, res, {
+      action: 'list_items',
+      folderId: req.params.folderId
+    });
+  }
+);
+
+// تحميل ملف واحد
+app.get(
+  '/api/gallery/items/:fileId/download',
+  requireAuth,
+  requireGallery,
+  (req, res) => {
+    proxyGalleryBinary(req, res, {
+      action: 'download_file',
+      fileId: req.params.fileId
+    });
+  }
+);
+
+// تحميل مجموعة ملفات محددة أو فولدر كامل كملف ZIP واحد
+app.post('/api/gallery/download-zip', requireAuth, requireGallery, (req, res) => {
+  const { fileIds, folderId } = req.body || {};
+
+  const ids = Array.isArray(fileIds)
+    ? fileIds.filter((id) => typeof id === 'string' && id.trim())
+    : [];
+
+  if (!ids.length && !folderId) {
+    return res.status(400).json({
+      error: 'Valid fileIds or folderId is required'
+    });
+  }
+
+  proxyGalleryBinary(req, res, {
+    action: 'download_zip',
+    fileIds: ids,
+    folderId: folderId || null
+  });
+});
+
+// رفع ملف جديد في فولدر content_team1 الخاص بيه بس
+app.post(
+  '/api/gallery/upload',
+  requireAuth,
+  requireGallery,
+  uploadMemory.single('file'),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'file is required' });
+      }
+
+      const formData = new FormData();
+      formData.append('action', 'upload_file');
+      formData.append('targetFolderId', GALLERY_UPLOAD_FOLDER_ID);
+      formData.append('uploadedBy', req.user?.username || 'content_team1');
+      formData.append(
+        'file',
+        new Blob([req.file.buffer], { type: req.file.mimetype }),
+        req.file.originalname
+      );
+
+      const response = await fetch(process.env.N8N_GALLERY_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+        },
+        body: formData
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        return res.status(502).json({
+          error: data.error || 'Failed to upload file via n8n'
+        });
+      }
+
+      res.json({ success: true, file: data.file || data });
+    } catch (err) {
+      console.error('gallery upload error:', err);
+      res.status(500).json({
+        error: 'Internal server error',
+        details: err.message
+      });
+    }
+  }
+);
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
