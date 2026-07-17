@@ -331,6 +331,23 @@ ensureSavedMediaTables().catch((err) => {
   console.error('Failed to ensure saved_media tables:', err);
 });
 
+// ترتيب مخصص لملفات المعرض داخل كل فولدر — بنخزنه عندنا مش في درايف،
+// عشان الترتيب اليدوي (Fractional Indexing) يبقى بسيط ومن غير أي تعديل
+// إضافي في n8n
+async function ensureGalleryOrderTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS gallery_file_order (
+      file_id TEXT PRIMARY KEY,
+      sort_order DOUBLE PRECISION NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+}
+
+ensureGalleryOrderTable().catch((err) => {
+  console.error('Failed to ensure gallery_file_order table:', err);
+});
+
 async function ensurePushSubscriptionsTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -2881,7 +2898,7 @@ async function fetchGalleryFolderContents(folderId, { includeUploadFolder } = {}
   }
 
   const folders = Array.isArray(foldersData.folders) ? foldersData.folders : [];
-  const items = Array.isArray(itemsData.items) ? itemsData.items : [];
+  let items = Array.isArray(itemsData.items) ? itemsData.items : [];
 
   if (
     includeUploadFolder &&
@@ -2896,7 +2913,31 @@ async function fetchGalleryFolderContents(folderId, { includeUploadFolder } = {}
     });
   }
 
+  if (items.length) {
+    items = await applyGalleryItemOrder(items);
+  }
+
   return { folders, items };
+}
+
+// بيحط ترتيب مخصص (لو موجود) على كل ملف، وبيرتب القايمة بيه. الملفات اللي
+// ما اتعرضتش عليها إعادة ترتيب لسه بتاخد ترتيب افتراضي بمسافات واسعة بينهم
+// (1000, 2000, 3000...) عشان يبقى في مكان كافي نحط ترتيب كسري بينهم بعدين
+async function applyGalleryItemOrder(items) {
+  const result = await pool.query(
+    `SELECT file_id, sort_order FROM gallery_file_order WHERE file_id = ANY($1::text[])`,
+    [items.map((i) => i.id)]
+  );
+
+  const orderMap = new Map(result.rows.map((r) => [r.file_id, Number(r.sort_order)]));
+
+  const withOrder = items.map((item, index) => ({
+    ...item,
+    order: orderMap.has(item.id) ? orderMap.get(item.id) : (index + 1) * 1000
+  }));
+
+  withOrder.sort((a, b) => a.order - b.order);
+  return withOrder;
 }
 
 // جذر المعرض (الفولدر الرئيسي) + فولدر رفعيات content_team1 حتى لو كان
@@ -3093,11 +3134,9 @@ app.delete('/api/gallery/items/:fileId', requireAuth, requireGallery, async (req
 // نقل ملف أو فولدر لفولدر تاني (سحب وإفلات في الواجهة)
 app.post('/api/gallery/items/:nodeId/move', requireAuth, requireGallery, async (req, res) => {
   try {
-    const targetFolderId = String(req.body?.targetFolderId || '').trim();
-
-    if (!targetFolderId) {
-      return res.status(400).json({ error: 'targetFolderId is required' });
-    }
+    // فاضي = نقل لجذر المعرض (الفولدر الرئيسي)
+    const targetFolderId =
+      String(req.body?.targetFolderId || '').trim() || GALLERY_ROOT_FOLDER_ID;
 
     const response = await callGalleryWebhook({
       action: 'move_file',
@@ -3116,6 +3155,34 @@ app.post('/api/gallery/items/:nodeId/move', requireAuth, requireGallery, async (
     res.json({ success: true });
   } catch (err) {
     console.error('gallery move error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+});
+
+// ترتيب ملف يدويًا جوه نفس الفولدر (سحب وإفلات فوق ملف تاني) — بنخزن
+// الترتيب عندنا في بوستجرس، مش في درايف، فمحتاج صفر تعديل في n8n
+app.post('/api/gallery/items/:fileId/reorder', requireAuth, requireGallery, async (req, res) => {
+  try {
+    const order = Number(req.body?.order);
+
+    if (!Number.isFinite(order)) {
+      return res.status(400).json({ error: 'Valid order is required' });
+    }
+
+    await pool.query(
+      `INSERT INTO gallery_file_order (file_id, sort_order)
+       VALUES ($1, $2)
+       ON CONFLICT (file_id)
+       DO UPDATE SET sort_order = $2, updated_at = now()`,
+      [req.params.fileId, order]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('gallery reorder error:', err);
     res.status(500).json({
       error: 'Internal server error',
       details: err.message
