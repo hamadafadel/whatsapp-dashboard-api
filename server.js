@@ -2844,6 +2844,12 @@ async function proxyGalleryBinary(req, res, payload) {
       res.setHeader('Content-Disposition', contentDisposition);
     }
 
+    // نفس الصورة بترجع تتحمّل كل مرة تفتح فيها الفولدر من غير الكاش ده —
+    // الملف مربوط بـ fileId ثابت، فمن الآمن نخلي المتصفح يحتفظ بنسخة منه
+    if (payload.action === 'download_file') {
+      res.setHeader('Cache-Control', 'private, max-age=86400');
+    }
+
     Readable.fromWeb(response.body).pipe(res);
   } catch (err) {
     console.error('gallery binary proxy error:', err);
