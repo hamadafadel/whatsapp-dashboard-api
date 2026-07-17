@@ -3090,6 +3090,39 @@ app.delete('/api/gallery/items/:fileId', requireAuth, requireGallery, async (req
   }
 });
 
+// نقل ملف أو فولدر لفولدر تاني (سحب وإفلات في الواجهة)
+app.post('/api/gallery/items/:nodeId/move', requireAuth, requireGallery, async (req, res) => {
+  try {
+    const targetFolderId = String(req.body?.targetFolderId || '').trim();
+
+    if (!targetFolderId) {
+      return res.status(400).json({ error: 'targetFolderId is required' });
+    }
+
+    const response = await callGalleryWebhook({
+      action: 'move_file',
+      nodeId: req.params.nodeId,
+      targetFolderId
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: data.error || 'Failed to move item via n8n'
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('gallery move error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
