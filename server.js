@@ -2854,37 +2854,55 @@ async function proxyGalleryBinary(req, res, payload) {
   }
 }
 
-// كل الفولدرات الفرعية من الفولدر الرئيسي + فولدر رفعيات content_team1
-// (اللي ممكن يكون برّه الفولدر الرئيسي تمامًا في درايف، فمش هيظهر مع نتائج
-// البحث العادية — بنضيفه يدويًا هنا كعنصر ثابت بدل ما نلمس ورك فلو n8n)
-app.get('/api/gallery/folders', requireAuth, requireGallery, async (req, res) => {
-  try {
-    const response = await callGalleryWebhook({
-      action: 'list_folders',
-      rootFolderId: GALLERY_ROOT_FOLDER_ID
+// بيرجع محتويات أي فولدر (فولدرات فرعية + ملفات) — بيستخدم نفس الـ n8n
+// actions الموجودة أصلاً (list_folders/list_items) بس بيبعتلهم أي parentId،
+// مش بس الفولدر الرئيسي، عشان يدعم تداخل فولدرات جوه بعض من غير أي تعديل
+// في n8n. الفولدر الرئيسي عمقه غير محدود دلوقتي.
+async function fetchGalleryFolderContents(folderId, { includeUploadFolder } = {}) {
+  const [foldersRes, itemsRes] = await Promise.all([
+    callGalleryWebhook({ action: 'list_folders', rootFolderId: folderId }),
+    callGalleryWebhook({ action: 'list_items', folderId })
+  ]);
+
+  const foldersData = await foldersRes.json().catch(() => ({}));
+  const itemsData = await itemsRes.json().catch(() => ({}));
+
+  if (!foldersRes.ok) {
+    throw new Error(foldersData.error || 'Failed to list folders via n8n');
+  }
+  if (!itemsRes.ok) {
+    throw new Error(itemsData.error || 'Failed to list items via n8n');
+  }
+
+  const folders = Array.isArray(foldersData.folders) ? foldersData.folders : [];
+  const items = Array.isArray(itemsData.items) ? itemsData.items : [];
+
+  if (
+    includeUploadFolder &&
+    GALLERY_UPLOAD_FOLDER_ID &&
+    GALLERY_UPLOAD_FOLDER_ID !== GALLERY_ROOT_FOLDER_ID &&
+    !folders.some((f) => f.id === GALLERY_UPLOAD_FOLDER_ID)
+  ) {
+    folders.push({
+      id: GALLERY_UPLOAD_FOLDER_ID,
+      name: 'From Content Team',
+      isOwnUploadFolder: true
     });
+  }
 
-    const data = await response.json().catch(() => ({}));
+  return { folders, items };
+}
 
-    if (!response.ok) {
-      return res.status(502).json({
-        error: data.error || 'Gallery request failed in n8n'
-      });
-    }
-
-    const folders = Array.isArray(data.folders) ? data.folders : [];
-
-    if (
-      GALLERY_UPLOAD_FOLDER_ID &&
-      GALLERY_UPLOAD_FOLDER_ID !== GALLERY_ROOT_FOLDER_ID &&
-      !folders.some((f) => f.id === GALLERY_UPLOAD_FOLDER_ID)
-    ) {
-      folders.push({ id: GALLERY_UPLOAD_FOLDER_ID, name: '📤 رفعياتي' });
-    }
-
-    res.json({ folders });
+// جذر المعرض (الفولدر الرئيسي) + فولدر رفعيات content_team1 حتى لو كان
+// برّه الفولدر الرئيسي تمامًا في درايف
+app.get('/api/gallery/browse', requireAuth, requireGallery, async (req, res) => {
+  try {
+    const data = await fetchGalleryFolderContents(GALLERY_ROOT_FOLDER_ID, {
+      includeUploadFolder: true
+    });
+    res.json(data);
   } catch (err) {
-    console.error('gallery folders error:', err);
+    console.error('gallery browse root error:', err);
     res.status(500).json({
       error: 'Internal server error',
       details: err.message
@@ -2892,18 +2910,19 @@ app.get('/api/gallery/folders', requireAuth, requireGallery, async (req, res) =>
   }
 });
 
-// محتويات فولدر معين
-app.get(
-  '/api/gallery/folders/:folderId/items',
-  requireAuth,
-  requireGallery,
-  (req, res) => {
-    proxyGalleryJson(req, res, {
-      action: 'list_items',
-      folderId: req.params.folderId
+// محتويات أي فولدر تاني (على أي عمق)
+app.get('/api/gallery/browse/:folderId', requireAuth, requireGallery, async (req, res) => {
+  try {
+    const data = await fetchGalleryFolderContents(req.params.folderId);
+    res.json(data);
+  } catch (err) {
+    console.error('gallery browse folder error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
     });
   }
-);
+});
 
 // تحميل ملف واحد
 app.get(
@@ -2987,6 +3006,32 @@ app.post(
     }
   }
 );
+
+// حذف ملف (الواجهة بتظهر زرار الحذف بس جوه فولدر content_team1 نفسه)
+app.delete('/api/gallery/items/:fileId', requireAuth, requireGallery, async (req, res) => {
+  try {
+    const response = await callGalleryWebhook({
+      action: 'delete_file',
+      fileId: req.params.fileId
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: data.error || 'Failed to delete file via n8n'
+      });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('gallery delete error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 
