@@ -1755,6 +1755,11 @@ const WHATSAPP_TEMPLATES = {
     label: 'متابعة',
     templateName: 'after_24h',
     language: 'ar'
+  },
+  order_confirm_ask: {
+    label: 'تأكيد الطلب',
+    templateName: 'order_confirm_ask',
+    language: 'ar'
   }
 };
 
