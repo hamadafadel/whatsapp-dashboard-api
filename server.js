@@ -1748,6 +1748,99 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
   }
 });
 
+app.post('/api/meta-purchase', requireAuth, async (req, res) => {
+  try {
+    const {
+      sessionId,
+      amount,
+      currency = 'EGP',
+      description = ''
+    } = req.body || {};
+
+    const normalizedSessionId = String(sessionId || '').trim();
+    const normalizedAmount = Number(amount);
+    const normalizedCurrency = String(currency || 'EGP')
+      .trim()
+      .toUpperCase();
+
+    const normalizedDescription = String(description || '').trim();
+
+    if (!normalizedSessionId) {
+      return res.status(400).json({
+        error: 'sessionId is required'
+      });
+    }
+
+    if (
+      !Number.isFinite(normalizedAmount) ||
+      normalizedAmount <= 0
+    ) {
+      return res.status(400).json({
+        error: 'قيمة الطلب غير صحيحة'
+      });
+    }
+
+    if (normalizedCurrency !== 'EGP') {
+      return res.status(400).json({
+        error: 'العملة المسموح بها هي EGP'
+      });
+    }
+
+    const orderCode =
+      `META-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const agentName =
+      req.user?.displayName ||
+      req.user?.username ||
+      'Agent';
+
+    const response = await fetch(
+      process.env.N8N_SEND_WEBHOOK_URL,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+        },
+        body: JSON.stringify({
+          sessionId: normalizedSessionId,
+          messageKind: 'meta_purchase',
+          actionId: 'meta_purchase',
+          actionLabel: 'إنشاء طلب',
+          amount: normalizedAmount,
+          currency: normalizedCurrency,
+          description: normalizedDescription,
+          orderCode,
+          agentName
+        })
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: 'فشل إرسال الطلب إلى n8n',
+        details: data
+      });
+    }
+
+    return res.json({
+      success: true,
+      orderCode,
+      data
+    });
+
+  } catch (err) {
+    console.error('meta-purchase error:', err);
+
+    return res.status(500).json({
+      error: 'Internal server error',
+      details: err.message
+    });
+  }
+});
+
 // تيمبليتات الواتس المعتمدة (بره فترة الـ 24 ساعة). templateName/language لازم
 // تطابق بالظبط اسم التيمبليت المسجّل ومعتمد في WhatsApp Business Manager
 const WHATSAPP_TEMPLATES = {
