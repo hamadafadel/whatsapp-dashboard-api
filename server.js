@@ -58,23 +58,40 @@ if (!fs.existsSync(thumbnailsDir)) {
   fs.mkdirSync(thumbnailsDir, { recursive: true });
 }
 
-async function createImageThumbnail(filePath, fileName) {
+async function createImageThumbnail(filePath, fileName, isVideo = false) {
   const thumbnailName = `${path.parse(fileName).name}.jpg`;
   const thumbnailPath = path.join(thumbnailsDir, thumbnailName);
 
-  await execFileAsync('ffmpeg', [
-    '-y',
-    '-i',
-    filePath,
-    '-vf',
-    "scale='min(480,iw)':-2",
-    '-frames:v',
-    '1',
-    '-q:v',
-    '5',
-    thumbnailPath
-  ]);
+  async function extract(seekSeconds) {
+    const args = ['-y'];
 
+    if (seekSeconds) {
+      args.push('-ss', String(seekSeconds));
+    }
+
+    args.push(
+      '-i', filePath,
+      '-vf', "scale='min(480,iw)':-2",
+      '-frames:v', '1',
+      '-q:v', '5',
+      thumbnailPath
+    );
+
+    await execFileAsync('ffmpeg', args);
+  }
+
+  if (isVideo) {
+    // أول فريم (وقت 0) غالبًا بيكون فريم أسود/فيد إن، فبنقفز ثانية جوه
+    // الفيديو الأول؛ لو الفيديو أقصر من ثانية، بنرجع نجرب من غير seek
+    try {
+      await extract(1);
+      return thumbnailName;
+    } catch (err) {
+      // fallthrough للمحاولة من غير seek
+    }
+  }
+
+  await extract(0);
   return thumbnailName;
 }
 
@@ -374,8 +391,13 @@ async function ensureSavedMediaTables() {
       thumbnail_url TEXT NOT NULL DEFAULT '',
       file_path TEXT NOT NULL DEFAULT '',
       created_by TEXT NOT NULL DEFAULT '',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      sort_order DOUBLE PRECISION
     )
+  `);
+
+  await pool.query(`
+    ALTER TABLE saved_media_items ADD COLUMN IF NOT EXISTS sort_order DOUBLE PRECISION
   `);
 }
 
@@ -2533,10 +2555,10 @@ app.get('/api/saved-media-folders/:id/items', requireAuth, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, media_kind, media_url, thumbnail_url
+      `SELECT id, media_kind, media_url, thumbnail_url, sort_order
        FROM saved_media_items
        WHERE folder_id = $1
-       ORDER BY id ASC`,
+       ORDER BY COALESCE(sort_order, id) ASC`,
       [folderId]
     );
 
@@ -2628,7 +2650,8 @@ app.post(
       try {
         const thumbnailName = await createImageThumbnail(
           filePath,
-          fileName
+          fileName,
+          mediaKind === 'video'
         );
 
         thumbnailUrl = `https://${req.get('host')}/uploads/thumbs/${thumbnailName}`;
@@ -2682,6 +2705,36 @@ app.delete('/api/saved-media-items/:id', requireAuth, requireAdmin, async (req, 
     console.error('saved-media item delete error:', err);
     res.status(500).json({
       error: 'Error deleting item',
+      details: err.message
+    });
+  }
+});
+
+// ترتيب عنصر يدويًا جوه نفس الفولدر (سحب وإفلات فوق عنصر تاني) — أدمن فقط،
+// زي إضافة/حذف الوسائط المحفوظة
+app.post('/api/saved-media-items/:id/reorder', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const order = Number(req.body?.order);
+
+    if (!id || !Number.isFinite(order)) {
+      return res.status(400).json({ error: 'Valid id and order are required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE saved_media_items SET sort_order = $1 WHERE id = $2 RETURNING id`,
+      [order, id]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('saved-media item reorder error:', err);
+    res.status(500).json({
+      error: 'Internal server error',
       details: err.message
     });
   }
