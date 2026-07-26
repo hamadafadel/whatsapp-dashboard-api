@@ -1605,7 +1605,10 @@ else if (!message) {
   });
 }
 
-    const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+    // من غير await قصدًا: مانستناش رد n8n/واتساب الكامل (بياخد ثواني بسبب
+    // الراوند تريب لـ WhatsApp API) قبل ما نرجع للداشبورد، عشان الرسالة تتبعت
+    // على طول من غير ما تحس الشاشة إنها واقفة.
+    fetch(process.env.N8N_SEND_WEBHOOK_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1620,34 +1623,33 @@ else if (!message) {
   emoji,
   agentName
 })
-    });
+    })
+      .then(async (response) => {
+        const data = await response.json().catch(() => ({}));
 
-    const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          console.error('send-message n8n error:', data);
+          return;
+        }
 
-    if (!response.ok) {
-      return res.status(500).json({
-        error: 'Failed to send message via n8n',
-        details: data
+        if (messageKind !== 'reaction') {
+          stampLatestAgentMessage(
+            sessionId,
+            agentName,
+            messageKind || 'text',
+            message || '',
+            replyTo
+          ).catch((err) => {
+            console.error('stampLatestAgentMessage error:', err);
+          });
+        }
+      })
+      .catch((err) => {
+        console.error('send-message webhook error:', err);
       });
-    }
-
-    if (messageKind !== 'reaction') {
-      // من غير await قصدًا: تثبيت اسم المرسل والرد المقتبس مش لازم المستخدم
-      // ينتظره، وده كان بياخد جولة Postgres إضافية قبل ما الرد يرجع للداشبورد
-      stampLatestAgentMessage(
-        sessionId,
-        agentName,
-        messageKind || 'text',
-        message || '',
-        replyTo
-      ).catch((err) => {
-        console.error('stampLatestAgentMessage error:', err);
-      });
-    }
 
     res.json({
-      success: true,
-      data
+      success: true
     });
   } catch (err) {
     console.error('send-message error:', err);
