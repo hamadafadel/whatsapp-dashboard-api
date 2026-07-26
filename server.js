@@ -78,6 +78,58 @@ async function createImageThumbnail(filePath, fileName) {
   return thumbnailName;
 }
 
+// بيضغط الفيديو لحد ما يبقى تحت حد واتساب (بيحسب البتريت المطلوب بناءً
+// على مدة الفيديو، عشان الحجم النهائي يوصل تحت الحد المطلوب)
+async function compressVideoForWhatsApp(filePath, originalFileName, targetBytes) {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    filePath
+  ]);
+
+  const duration = parseFloat(stdout.trim()) || 0;
+
+  if (!duration) {
+    throw new Error('تعذر قراءة مدة الفيديو');
+  }
+
+  const AUDIO_BITRATE = 64000;
+  const SAFETY_MARGIN = 0.9; // هامش أمان عشان حجم الـ container الفعلي غالبًا بيزيد شوية عن البتريت المحسوب
+  const targetBits = targetBytes * 8 * SAFETY_MARGIN;
+  const videoBitrate = Math.max(
+    Math.floor(targetBits / duration) - AUDIO_BITRATE,
+    150000
+  );
+
+  const parsedName = path.parse(originalFileName);
+  const compressedFileName = `${parsedName.name}-compressed.mp4`;
+  const compressedPath = path.join(uploadsDir, compressedFileName);
+
+  await execFileAsync('ffmpeg', [
+    '-y',
+    '-i', filePath,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-b:v', String(videoBitrate),
+    '-maxrate', String(Math.floor(videoBitrate * 1.5)),
+    '-bufsize', String(videoBitrate * 2),
+    '-vf', "scale='min(1280,iw)':-2",
+    '-c:a', 'aac',
+    '-b:a', String(AUDIO_BITRATE),
+    '-movflags', '+faststart',
+    compressedPath
+  ]);
+
+  const stats = fs.statSync(compressedPath);
+
+  return {
+    path: compressedPath,
+    filename: compressedFileName,
+    size: stats.size
+  };
+}
+
 // الملفات المرفوعة أسماؤها فريدة، لذلك يمكن تخزينها بأمان لمدة سنة.
 app.use(
   '/uploads',
@@ -2460,22 +2512,54 @@ app.post(
       const WHATSAPP_MEDIA_LIMITS = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024 };
       const sizeLimit = WHATSAPP_MEDIA_LIMITS[mediaKind];
 
-      if (sizeLimit && req.file.size > sizeLimit) {
-        fs.unlink(req.file.path, () => {});
+      let filePath = req.file.path;
+      let fileName = req.file.filename;
+      let fileSize = req.file.size;
+
+      if (mediaKind === 'video' && sizeLimit && fileSize > sizeLimit) {
+        try {
+          const compressed = await compressVideoForWhatsApp(
+            filePath,
+            fileName,
+            sizeLimit
+          );
+
+          fs.unlink(filePath, () => {});
+          filePath = compressed.path;
+          fileName = compressed.filename;
+          fileSize = compressed.size;
+        } catch (error) {
+          console.error('Video compression failed:', error);
+          fs.unlink(filePath, () => {});
+
+          return res.status(500).json({
+            error: 'تعذر ضغط الفيديو، حاول برفع نسخة أصغر.'
+          });
+        }
+
+        if (fileSize > sizeLimit) {
+          fs.unlink(filePath, () => {});
+
+          return res.status(400).json({
+            error: 'الفيديو طويل جدًا حتى بعد الضغط، حاول تقصيره أو رفع نسخة أصغر.'
+          });
+        }
+      } else if (sizeLimit && fileSize > sizeLimit) {
+        fs.unlink(filePath, () => {});
 
         return res.status(400).json({
-          error: `حجم ${mediaKind === 'video' ? 'الفيديو' : 'الصورة'} أكبر من الحد المسموح به في واتساب (${Math.round(sizeLimit / (1024 * 1024))}MB). قلل الحجم وحاول تاني.`
+          error: `حجم الصورة أكبر من الحد المسموح به في واتساب (${Math.round(sizeLimit / (1024 * 1024))}MB). قلل الحجم وحاول تاني.`
         });
       }
 
-      const fileUrl = `https://${req.get('host')}/uploads/${req.file.filename}`;
+      const fileUrl = `https://${req.get('host')}/uploads/${fileName}`;
       let thumbnailUrl = '';
 
       if (mediaKind === 'image') {
         try {
           const thumbnailName = await createImageThumbnail(
-            req.file.path,
-            req.file.filename
+            filePath,
+            fileName
           );
 
           thumbnailUrl = `https://${req.get('host')}/uploads/thumbs/${thumbnailName}`;
@@ -2491,7 +2575,7 @@ app.post(
            (folder_id, media_kind, media_url, thumbnail_url, file_path, created_by)
          VALUES ($1, $2, $3, $4, $5, $6)
          RETURNING id, media_kind, media_url, thumbnail_url`,
-        [folderId, mediaKind, fileUrl, thumbnailUrl, req.file.path, createdBy]
+        [folderId, mediaKind, fileUrl, thumbnailUrl, filePath, createdBy]
       );
 
       res.json({ success: true, item: result.rows[0] });
