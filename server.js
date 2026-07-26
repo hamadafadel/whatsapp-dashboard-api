@@ -95,7 +95,7 @@ async function compressVideoForWhatsApp(filePath, originalFileName, targetBytes)
   }
 
   const AUDIO_BITRATE = 64000;
-  const SAFETY_MARGIN = 0.9; // هامش أمان عشان حجم الـ container الفعلي غالبًا بيزيد شوية عن البتريت المحسوب
+  const SAFETY_MARGIN = 0.95; // هامش أمان عشان حجم الـ container الفعلي غالبًا بيزيد شوية عن البتريت المحسوب
   const targetBits = targetBytes * 8 * SAFETY_MARGIN;
   const videoBitrate = Math.max(
     Math.floor(targetBits / duration) - AUDIO_BITRATE,
@@ -114,7 +114,7 @@ async function compressVideoForWhatsApp(filePath, originalFileName, targetBytes)
     '-b:v', String(videoBitrate),
     '-maxrate', String(Math.floor(videoBitrate * 1.5)),
     '-bufsize', String(videoBitrate * 2),
-    '-vf', "scale='min(1280,iw)':-2",
+    '-vf', "scale='min(1920,iw)':-2",
     '-c:a', 'aac',
     '-b:a', String(AUDIO_BITRATE),
     '-movflags', '+faststart',
