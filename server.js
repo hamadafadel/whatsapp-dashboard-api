@@ -2558,12 +2558,27 @@ app.get('/api/saved-media-folders/:id/items', requireAuth, async (req, res) => {
       `SELECT id, media_kind, media_url, thumbnail_url, sort_order
        FROM saved_media_items
        WHERE folder_id = $1
-       ORDER BY COALESCE(sort_order, id) ASC`,
+       ORDER BY id ASC`,
       [folderId]
     );
 
+    // مينفعش نرتب في الـ SQL بـ COALESCE(sort_order, id) — الـ id خام رقم
+    // صغير (زي 12) والـ sort_order بعد أول ترتيب يدوي بيبقى رقم كبير (زي
+    // 1500)، فالعناصر اللي لسه من غير sort_order كانت دايمًا بتفضل قبل أي
+    // عنصر اتحرك، حتى لو المفروض يتحرك لفوق. بنحسب ترتيب موحّد بنفس المقياس
+    // لكل العناصر هنا في الجافاسكريبت (زي ما بيحصل بالظبط في المعرض)
+    const itemsWithOrder = result.rows.map((item, index) => ({
+      ...item,
+      sort_order:
+        item.sort_order !== null && item.sort_order !== undefined
+          ? Number(item.sort_order)
+          : (index + 1) * 1000
+    }));
+
+    itemsWithOrder.sort((a, b) => a.sort_order - b.sort_order);
+
     res.json({
-      items: result.rows,
+      items: itemsWithOrder,
       canManage: req.user?.role === 'admin'
     });
   } catch (err) {
