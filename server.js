@@ -465,7 +465,8 @@ async function stampLatestAgentMessage(
   agentName,
   messageKind = 'text',
   messageLocator = '',
-  replyTo = null
+  replyTo = null,
+  forcedContent = null
 ) {
   if (!sessionId || !agentName) return;
 
@@ -473,66 +474,46 @@ async function stampLatestAgentMessage(
   // عشان يفضل ظاهر بعد أي إعادة تحميل، حتى لو الـ n8n نفسه ما بيحفظوش
   const hasReplyTo = Boolean(replyTo && replyTo.content);
 
+  // بعض ورش n8n بتحط نص غريب في content لما نبعت كابشن فاضي (بدل ما
+  // تسيبه فاضي). forcedContent بيسمحلنا نثبّت نص نظيف ("📷 صورة"/"🎥 فيديو")
+  // في قاعدة البيانات والداشبورد بس، من غير ما يتبعت لواتساب كـ caption فعلي
+  const hasForcedContent = forcedContent !== null && forcedContent !== undefined;
+
+  const params = [sessionId, agentName, messageKind, messageLocator];
+  let setExpr = `jsonb_set(cm.message, '{agent_name}', to_jsonb($2::text), true)`;
+
+  if (hasReplyTo) {
+    params.push(JSON.stringify(replyTo));
+    setExpr = `jsonb_set(${setExpr}, '{reply_to}', $${params.length}::jsonb, true)`;
+  }
+
+  if (hasForcedContent) {
+    params.push(forcedContent);
+    setExpr = `jsonb_set(${setExpr}, '{content}', to_jsonb($${params.length}::text), true)`;
+  }
+
   await pool.query(
-    hasReplyTo
-      ? `
-        WITH target AS (
-          SELECT id
-          FROM chat_memory
-          WHERE session_id = $1
-            AND message->>'type' = 'agent'
-            AND COALESCE(message->>'message_kind', 'text') = $3
-            AND (
-              $4 = ''
-              OR message->>'media_url' = $4
-              OR message->>'content' = $4
-            )
-          ORDER BY id DESC
-          LIMIT 1
+    `
+    WITH target AS (
+      SELECT id
+      FROM chat_memory
+      WHERE session_id = $1
+        AND message->>'type' = 'agent'
+        AND COALESCE(message->>'message_kind', 'text') = $3
+        AND (
+          $4 = ''
+          OR message->>'media_url' = $4
+          OR message->>'content' = $4
         )
-        UPDATE chat_memory AS cm
-        SET message = jsonb_set(
-          jsonb_set(
-            cm.message,
-            '{agent_name}',
-            to_jsonb($2::text),
-            true
-          ),
-          '{reply_to}',
-          $5::jsonb,
-          true
-        )
-        FROM target
-        WHERE cm.id = target.id
-        `
-      : `
-        WITH target AS (
-          SELECT id
-          FROM chat_memory
-          WHERE session_id = $1
-            AND message->>'type' = 'agent'
-            AND COALESCE(message->>'message_kind', 'text') = $3
-            AND (
-              $4 = ''
-              OR message->>'media_url' = $4
-              OR message->>'content' = $4
-            )
-          ORDER BY id DESC
-          LIMIT 1
-        )
-        UPDATE chat_memory AS cm
-        SET message = jsonb_set(
-          cm.message,
-          '{agent_name}',
-          to_jsonb($2::text),
-          true
-        )
-        FROM target
-        WHERE cm.id = target.id
-        `,
-    hasReplyTo
-      ? [sessionId, agentName, messageKind, messageLocator, JSON.stringify(replyTo)]
-      : [sessionId, agentName, messageKind, messageLocator]
+      ORDER BY id DESC
+      LIMIT 1
+    )
+    UPDATE chat_memory AS cm
+    SET message = ${setExpr}
+    FROM target
+    WHERE cm.id = target.id
+    `,
+    params
   );
 
   const payload = {
@@ -2272,6 +2253,17 @@ function deleteMediaFilesBestEffort(filePath) {
 // فالرسالة بتظهر "متبعتة" في الداشبورد بس ما توصلش للعميل.
 const WHATSAPP_MEDIA_LIMITS = { image: 5 * 1024 * 1024, video: 16 * 1024 * 1024 };
 
+// نص العرض الداخلي بس (الداشبورد وقايمة المحادثات) لما نبعت وسائط من
+// غير كابشن — أبدًا ما بيتبعت لواتساب كـ caption فعلي
+function mediaKindPlaceholderText(kind) {
+  if (kind === 'video') return '🎥 فيديو';
+  if (kind === 'image') return '📷 صورة';
+  if (kind === 'audio') return '🎙️ رسالة صوتية';
+  if (kind === 'sticker') return '🖼️ ملصق';
+  if (kind === 'document') return '📄 ملف';
+  return null;
+}
+
 async function sendSavedMediaToSession(item, sessionId, agentName, caption = '') {
   const sizeLimit = WHATSAPP_MEDIA_LIMITS[item.media_kind];
 
@@ -2315,7 +2307,9 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     sessionId,
     agentName,
     item.media_kind,
-    item.media_url
+    item.media_url,
+    null,
+    caption ? null : mediaKindPlaceholderText(item.media_kind)
   );
 
   return data;
@@ -2629,17 +2623,17 @@ app.post(
       const fileUrl = `https://${req.get('host')}/uploads/${fileName}`;
       let thumbnailUrl = '';
 
-      if (mediaKind === 'image') {
-        try {
-          const thumbnailName = await createImageThumbnail(
-            filePath,
-            fileName
-          );
+      // ffmpeg بيقدر ياخد أول فريم من الفيديو نفسه بنفس طريقة الصورة، فبيبقى
+      // معانا صورة مصغّرة تعرّف الفيديو من غير ما نحمّله كامل
+      try {
+        const thumbnailName = await createImageThumbnail(
+          filePath,
+          fileName
+        );
 
-          thumbnailUrl = `https://${req.get('host')}/uploads/thumbs/${thumbnailName}`;
-        } catch (error) {
-          console.error('Thumbnail creation failed:', error);
-        }
+        thumbnailUrl = `https://${req.get('host')}/uploads/thumbs/${thumbnailName}`;
+      } catch (error) {
+        console.error('Thumbnail creation failed:', error);
       }
 
       const createdBy = req.user?.username || '';
@@ -2984,7 +2978,9 @@ app.post(
       sessionId,
       agentName,
       messageKind,
-      fileUrl
+      fileUrl,
+      null,
+      caption ? null : mediaKindPlaceholderText(messageKind)
     );
 
     res.json({
