@@ -609,6 +609,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         latest.session_id,
         latest.content,
         latest.type,
+        latest.message_kind,
         names.customer_name,
         latest.id,
         COALESCE(unread.unread_count, 0) AS unread_count,
@@ -619,6 +620,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
           session_id,
           message->>'content' AS content,
           message->>'type' AS type,
+          message->>'message_kind' AS message_kind,
           id
         FROM chat_memory
         ORDER BY session_id, id DESC
@@ -2287,13 +2289,6 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     }
   }
 
-  // بدون نص ثابت هنا، بعض ورش n8n بتحاول تولّد كابشن تلقائي من محتوى
-  // الصورة نفسها (زي OCR)، وده اللي كان بيظهر كنص غريب تحت آخر رسالة
-  // في قايمة المحادثات. النص الثابت ده بيمنع أي توليد تلقائي.
-  const outgoingMessage =
-    caption ||
-    (item.media_kind === 'video' ? '🎥 فيديو' : '📷 صورة');
-
   const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
     method: 'POST',
     headers: {
@@ -2302,7 +2297,7 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     },
     body: JSON.stringify({
       sessionId,
-      message: outgoingMessage,
+      message: caption || '',
       messageKind: item.media_kind,
       mediaUrl: item.media_url,
       thumbnailUrl: item.thumbnail_url || '',
@@ -2325,6 +2320,85 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
 
   return data;
 }
+
+// إرسال الوسائط المحفوظة بيشتغل كـ"جوب" في الخلفية على السيرفر نفسه، مش
+// مربوط بطلب HTTP واحد بيستنى لحد ما كل العناصر تتبعت — عشان لو الأدمن/
+// الإيجنت قفل الداشبورد أو خرج من التطبيق، الإرسال يكمل لوحده، والداشبورد
+// يقدر يتابع التقدم (كام اتبعت من كام) عن طريق polling على الجوب لحد ما يخلص
+const sendMediaJobs = new Map();
+let sendMediaJobCounter = 0;
+
+function startSendMediaJob(items, sessionId, agentName, caption = '') {
+  const jobId = `job_${Date.now()}_${++sendMediaJobCounter}`;
+
+  const job = {
+    id: jobId,
+    total: items.length,
+    sent: 0,
+    failed: 0,
+    failReasons: [],
+    done: false,
+    cancelled: false,
+    createdAt: Date.now()
+  };
+
+  sendMediaJobs.set(jobId, job);
+
+  // بنشيل الجوبات القديمة بعد شوية عشان الـ Map ما يكبرش على الفاضي
+  setTimeout(() => sendMediaJobs.delete(jobId), 30 * 60 * 1000);
+
+  (async () => {
+    for (const item of items) {
+      if (job.cancelled) break;
+
+      try {
+        await sendSavedMediaToSession(item, sessionId, agentName, caption);
+        job.sent++;
+      } catch (err) {
+        console.error('send media job item failed:', err);
+        job.failed++;
+        job.failReasons.push(err.message || 'فشل الإرسال');
+      }
+    }
+
+    job.done = true;
+  })();
+
+  return job;
+}
+
+function serializeSendMediaJob(job) {
+  return {
+    id: job.id,
+    total: job.total,
+    sent: job.sent,
+    failed: job.failed,
+    failReasons: job.failReasons,
+    done: job.done,
+    cancelled: job.cancelled
+  };
+}
+
+app.get('/api/saved-media-send-jobs/:jobId', requireAuth, (req, res) => {
+  const job = sendMediaJobs.get(req.params.jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  res.json(serializeSendMediaJob(job));
+});
+
+app.post('/api/saved-media-send-jobs/:jobId/cancel', requireAuth, (req, res) => {
+  const job = sendMediaJobs.get(req.params.jobId);
+
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  job.cancelled = true;
+  res.json(serializeSendMediaJob(job));
+});
 
 // كل الفولدرات
 app.get('/api/saved-media-folders', requireAuth, async (req, res) => {
@@ -2644,14 +2718,9 @@ app.post('/api/saved-media-items/:id/send', requireAuth, async (req, res) => {
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    const data = await sendSavedMediaToSession(
-      result.rows[0],
-      sessionId,
-      agentName,
-      caption
-    );
+    const job = startSendMediaJob(result.rows, sessionId, agentName, caption);
 
-    res.json({ success: true, data });
+    res.json({ success: true, jobId: job.id, total: job.total });
   } catch (err) {
     console.error('saved-media send error:', err);
     res.status(500).json({
@@ -2690,26 +2759,9 @@ app.post('/api/saved-media-items/send-batch', requireAuth, async (req, res) => {
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    let sent = 0;
-    const failReasons = [];
+    const job = startSendMediaJob(result.rows, sessionId, agentName, '');
 
-    for (const item of result.rows) {
-      try {
-        await sendSavedMediaToSession(item, sessionId, agentName, '');
-        sent++;
-      } catch (err) {
-        console.error('batch send item failed:', err);
-        failReasons.push(err.message || 'فشل الإرسال');
-      }
-    }
-
-    res.json({
-      success: true,
-      sent,
-      failed: failReasons.length,
-      failReasons,
-      total: result.rows.length
-    });
+    res.json({ success: true, jobId: job.id, total: job.total });
   } catch (err) {
     console.error('saved-media batch send error:', err);
     res.status(500).json({
@@ -2746,26 +2798,9 @@ app.post('/api/saved-media-folders/:id/send', requireAuth, async (req, res) => {
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    let sent = 0;
-    const failReasons = [];
+    const job = startSendMediaJob(result.rows, sessionId, agentName, '');
 
-    for (const item of result.rows) {
-      try {
-        await sendSavedMediaToSession(item, sessionId, agentName, '');
-        sent++;
-      } catch (err) {
-        console.error('bulk send item failed:', err);
-        failReasons.push(err.message || 'فشل الإرسال');
-      }
-    }
-
-    res.json({
-      success: true,
-      sent,
-      failed: failReasons.length,
-      failReasons,
-      total: result.rows.length
-    });
+    res.json({ success: true, jobId: job.id, total: job.total });
   } catch (err) {
     console.error('saved-media folder send error:', err);
     res.status(500).json({
