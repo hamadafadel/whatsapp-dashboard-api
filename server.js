@@ -3398,6 +3398,16 @@ app.get(
         if (value) res.setHeader(headerName, value);
       });
 
+      if (req.query.download === '1') {
+        const requestedFileName =
+          path.basename(String(req.query.filename || 'video'));
+
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename*=UTF-8''${encodeURIComponent(requestedFileName)}`
+        );
+      }
+
       res.setHeader('Cache-Control', 'private, max-age=3600');
       res.status(response.status);
 
