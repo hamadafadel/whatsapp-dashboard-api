@@ -2957,28 +2957,60 @@ app.post(
 
       await execFileAsync("ffmpeg", [
         "-y",
+        "-fflags",
+        "+genpts",
         "-i",
         originalFilePath,
-
+        "-map",
+        "0:a:0",
         "-vn",
-
         "-c:a",
         "libopus",
-
         "-b:a",
         "32k",
-
         "-application",
         "voip",
-
+        "-frame_duration",
+        "20",
         "-ar",
         "48000",
-
         "-ac",
         "1",
-
+        "-avoid_negative_ts",
+        "make_zero",
+        "-f",
+        "ogg",
         finalFilePath
       ]);
+
+      const { stdout: audioProbeOutput } =
+        await execFileAsync("ffprobe", [
+          "-v",
+          "error",
+          "-select_streams",
+          "a:0",
+          "-show_entries",
+          "stream=codec_name,sample_rate,channels:format=duration",
+          "-of",
+          "json",
+          finalFilePath
+        ]);
+
+      const audioProbe = JSON.parse(audioProbeOutput || "{}");
+      const audioStream = audioProbe.streams?.[0] || {};
+      const audioDuration = Number(audioProbe.format?.duration || 0);
+      const audioFileSize = fs.statSync(finalFilePath).size;
+
+      if (
+        audioStream.codec_name !== "opus" ||
+        audioStream.sample_rate !== "48000" ||
+        Number(audioStream.channels) !== 1 ||
+        !Number.isFinite(audioDuration) ||
+        audioDuration <= 0 ||
+        audioFileSize <= 0
+      ) {
+        throw new Error("Invalid WhatsApp audio after conversion");
+      }
 
       // حذف النسخة الأصلية بعد نجاح التحويل
       if (
