@@ -3134,6 +3134,76 @@ async function callGalleryWebhook(payload) {
   return response;
 }
 
+let galleryDriveAccessToken = "";
+let galleryDriveAccessTokenExpiresAt = 0;
+
+async function getGalleryDriveAccessToken(forceRefresh = false) {
+  if (
+    !forceRefresh &&
+    galleryDriveAccessToken &&
+    Date.now() < galleryDriveAccessTokenExpiresAt
+  ) {
+    return galleryDriveAccessToken;
+  }
+
+  const clientId = process.env.GOOGLE_DRIVE_CLIENT_ID || "";
+  const clientSecret = process.env.GOOGLE_DRIVE_CLIENT_SECRET || "";
+  const refreshToken = process.env.GOOGLE_DRIVE_REFRESH_TOKEN || "";
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error("Google Drive streaming credentials are not configured");
+  }
+
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      client_id: clientId,
+      client_secret: clientSecret,
+      refresh_token: refreshToken,
+      grant_type: "refresh_token"
+    })
+  });
+
+  const tokenData = await tokenResponse.json().catch(() => ({}));
+
+  if (!tokenResponse.ok || !tokenData.access_token) {
+    throw new Error(
+      tokenData.error_description ||
+      tokenData.error ||
+      "Failed to refresh Google Drive access token"
+    );
+  }
+
+  galleryDriveAccessToken = tokenData.access_token;
+  galleryDriveAccessTokenExpiresAt =
+    Date.now() + Math.max(Number(tokenData.expires_in || 3600) - 60, 60) * 1000;
+
+  return galleryDriveAccessToken;
+}
+
+async function fetchGalleryVideo(fileId, range, forceRefresh = false, signal) {
+  const accessToken = await getGalleryDriveAccessToken(forceRefresh);
+  const headers = {
+    Authorization: `Bearer ${accessToken}`
+  };
+
+  if (range) headers.Range = range;
+
+  const response = await fetch(
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media`,
+    { headers, signal }
+  );
+
+  if (response.status === 401 && !forceRefresh) {
+    return fetchGalleryVideo(fileId, range, true, signal);
+  }
+
+  return response;
+}
+
 // بيمرر رد n8n (JSON) للمتصفح زي ما هو
 async function proxyGalleryJson(req, res, payload) {
   try {
@@ -3285,6 +3355,69 @@ app.get('/api/gallery/browse/:folderId', requireAuth, requireGallery, async (req
     });
   }
 });
+
+// تشغيل فيديو مباشرة من Google Drive مع دعم Range بدون تمرير الملف عبر n8n
+app.get(
+  '/api/gallery/items/:fileId/video-stream',
+  requireAuth,
+  requireGallery,
+  async (req, res) => {
+    const abortController = new AbortController();
+
+    res.on('close', () => {
+      if (!res.writableEnded) abortController.abort();
+    });
+
+    try {
+      const range = req.headers.range || '';
+      const response = await fetchGalleryVideo(
+        req.params.fileId,
+        range,
+        false,
+        abortController.signal
+      );
+
+      if (!response.ok || !response.body) {
+        const data = await response.json().catch(() => ({}));
+        return res.status(response.status || 502).json({
+          error: data.error?.message || 'Failed to stream gallery video'
+        });
+      }
+
+      const forwardedHeaders = [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'etag',
+        'last-modified'
+      ];
+
+      forwardedHeaders.forEach((headerName) => {
+        const value = response.headers.get(headerName);
+        if (value) res.setHeader(headerName, value);
+      });
+
+      res.setHeader('Cache-Control', 'private, max-age=3600');
+      res.status(response.status);
+
+      Readable.fromWeb(response.body).pipe(res);
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+
+      console.error('gallery video stream error:', err);
+
+      if (!res.headersSent) {
+        res.status(502).json({
+          error: 'Failed to stream gallery video',
+          details: err.message
+        });
+      } else {
+        res.destroy(err);
+      }
+    }
+  }
+);
 
 // تحميل ملف واحد
 app.get(
