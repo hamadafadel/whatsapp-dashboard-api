@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { Readable } = require('stream');
 
 const express = require('express');
@@ -15,7 +16,11 @@ const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  verify(req, res, buffer) {
+    req.rawBody = Buffer.from(buffer);
+  }
+}));
 // منع تخزين ملفات واجهة الداشبورد القديمة
 app.use((req, res, next) => {
   const noCacheFiles = [
@@ -237,6 +242,12 @@ const DASHBOARD_GALLERY_USERNAME =
 const DASHBOARD_GALLERY_PASSWORD =
   process.env.DASHBOARD_GALLERY_PASSWORD || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || '';
+const META_APP_SECRET = process.env.META_APP_SECRET || '';
+const N8N_MESSENGER_WEBHOOK_URL =
+  process.env.N8N_MESSENGER_WEBHOOK_URL || '';
+const N8N_FB_SEND_WEBHOOK_URL =
+  process.env.N8N_FB_SEND_WEBHOOK_URL || '';
 
 // فولدر جوجل درايف الرئيسي لمعرض الصور، وفولدر رفعيات content_team1 الخاص بيه
 const GALLERY_ROOT_FOLDER_ID =
@@ -353,6 +364,38 @@ const pool = new Pool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
 });
+
+function getConversationChannel(sessionId) {
+  return String(sessionId || '').startsWith('fb:')
+    ? 'messenger'
+    : 'whatsapp';
+}
+
+function getDashboardSendWebhookUrl(sessionId) {
+  return getConversationChannel(sessionId) === 'messenger'
+    ? N8N_FB_SEND_WEBHOOK_URL
+    : process.env.N8N_SEND_WEBHOOK_URL;
+}
+
+function safeEqualText(left, right) {
+  const a = Buffer.from(String(left || ''));
+  const b = Buffer.from(String(right || ''));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function verifyMessengerSignature(req) {
+  if (!META_APP_SECRET || !req.rawBody) return false;
+
+  const received = String(req.headers['x-hub-signature-256'] || '');
+  if (!received.startsWith('sha256=')) return false;
+
+  const expected = `sha256=${crypto
+    .createHmac('sha256', META_APP_SECRET)
+    .update(req.rawBody)
+    .digest('hex')}`;
+
+  return safeEqualText(received, expected);
+}
 
 async function ensureSavedRepliesTable() {
   await pool.query(`
@@ -610,6 +653,10 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
       `
       SELECT
         latest.session_id,
+        CASE
+          WHEN latest.session_id LIKE 'fb:%' THEN 'messenger'
+          ELSE COALESCE(NULLIF(latest.channel, ''), 'whatsapp')
+        END AS channel,
         latest.content,
         latest.type,
         latest.message_kind,
@@ -624,6 +671,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
           message->>'content' AS content,
           message->>'type' AS type,
           message->>'message_kind' AS message_kind,
+          message->>'channel' AS channel,
           id
         FROM chat_memory
         ORDER BY session_id, id DESC
@@ -844,6 +892,71 @@ app.get('/api/media/:sessionId', requireAuth, async (req, res) => {
 // Health
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true });
+});
+
+// Meta Messenger Webhook verification.
+app.get('/api/webhooks/messenger', (req, res) => {
+  const mode = String(req.query['hub.mode'] || '');
+  const token = String(req.query['hub.verify_token'] || '');
+  const challenge = String(req.query['hub.challenge'] || '');
+
+  if (
+    mode === 'subscribe' &&
+    META_VERIFY_TOKEN &&
+    safeEqualText(token, META_VERIFY_TOKEN)
+  ) {
+    console.log('[MESSENGER] Webhook verified');
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+// Verify authenticity first, acknowledge Meta quickly, then let the dedicated
+// n8n workflow normalize, deduplicate and process individual messaging events.
+app.post('/api/webhooks/messenger', (req, res) => {
+  if (!verifyMessengerSignature(req)) {
+    console.warn('[MESSENGER] Rejected webhook with invalid signature');
+    return res.sendStatus(401);
+  }
+
+  const body = req.body || {};
+  if (body.object !== 'page') return res.sendStatus(404);
+
+  res.sendStatus(200);
+
+  if (!N8N_MESSENGER_WEBHOOK_URL) {
+    console.error('[MESSENGER] N8N_MESSENGER_WEBHOOK_URL is missing');
+    return;
+  }
+
+  const events = (Array.isArray(body.entry) ? body.entry : [])
+    .flatMap((entry) =>
+      (Array.isArray(entry.messaging) ? entry.messaging : []).map((event) => ({
+        object: body.object,
+        pageId: String(entry.id || ''),
+        entryTime: entry.time || null,
+        event
+      }))
+    );
+
+  for (const item of events) {
+    const psid = String(item.event?.sender?.id || '');
+    console.log(
+      `[MESSENGER] Incoming event session=${psid ? `fb:${psid}` : 'unknown'}`
+    );
+
+    fetch(N8N_MESSENGER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+      },
+      body: JSON.stringify(item)
+    }).catch((err) => {
+      console.error('[MESSENGER] n8n forward failed:', err.message);
+    });
+  }
 });
 
 // SSE test
@@ -1662,24 +1775,65 @@ else if (!message) {
   });
 }
 
+    const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
+
+    if (!sendWebhookUrl) {
+      return res.status(503).json({
+        error: `${getConversationChannel(sessionId)} send webhook is not configured`
+      });
+    }
+
+    const outboundPayload = {
+      sessionId,
+      message,
+      replyTo,
+      messageKind,
+      messageId,
+      emoji,
+      agentName
+    };
+
+    if (getConversationChannel(sessionId) === 'messenger') {
+      const response = await fetch(sendWebhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+        },
+        body: JSON.stringify(outboundPayload)
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        return res.status(response.status >= 400 && response.status < 500 ? response.status : 502).json({
+          error: data.error || 'Messenger send workflow failed',
+          details: data
+        });
+      }
+
+      if (messageKind !== 'reaction') {
+        await stampLatestAgentMessage(
+          sessionId,
+          agentName,
+          messageKind || 'text',
+          message || '',
+          replyTo
+        );
+      }
+
+      return res.json({ success: true, channel: 'messenger', data });
+    }
+
     // من غير await قصدًا: مانستناش رد n8n/واتساب الكامل (بياخد ثواني بسبب
     // الراوند تريب لـ WhatsApp API) قبل ما نرجع للداشبورد، عشان الرسالة تتبعت
     // على طول من غير ما تحس الشاشة إنها واقفة.
-    fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+    fetch(sendWebhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': process.env.INTERNAL_API_TOKEN || ''
       },
-      body: JSON.stringify({
-  sessionId,
-  message,
-  replyTo,
-  messageKind,
-  messageId,
-  emoji,
-  agentName
-})
+      body: JSON.stringify(outboundPayload)
     })
       .then(async (response) => {
         const data = await response.json().catch(() => ({}));
@@ -1750,9 +1904,10 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
       });
     }
 
+    const channel = getConversationChannel(sessionId);
     const lastCustomerMessageAt = await getLastCustomerMessageTime(sessionId);
 
-    if (lastCustomerMessageAt) {
+    if (channel === 'whatsapp' && lastCustomerMessageAt) {
       const hoursPassed =
         (Date.now() - new Date(lastCustomerMessageAt).getTime()) / (1000 * 60 * 60);
 
@@ -1768,7 +1923,18 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
       req.user?.username ||
       'Agent';
 
-    const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+    const sendWebhookUrl =
+      channel === 'messenger'
+        ? N8N_FB_SEND_WEBHOOK_URL
+        : process.env.N8N_SEND_WEBHOOK_URL;
+
+    if (!sendWebhookUrl) {
+      return res.status(503).json({
+        error: `${channel} dashboard action webhook is not configured`
+      });
+    }
+
+    const response = await fetch(sendWebhookUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1779,6 +1945,7 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
         messageKind: 'dashboard_action',
         actionId,
         actionLabel,
+        channel,
         agentName
       })
     });
@@ -2287,7 +2454,10 @@ function mediaKindPlaceholderText(kind) {
 }
 
 async function sendSavedMediaToSession(item, sessionId, agentName, caption = '') {
-  const sizeLimit = WHATSAPP_MEDIA_LIMITS[item.media_kind];
+  const channel = getConversationChannel(sessionId);
+  const sizeLimit = channel === 'whatsapp'
+    ? WHATSAPP_MEDIA_LIMITS[item.media_kind]
+    : null;
 
   if (sizeLimit && item.file_path) {
     try {
@@ -2303,7 +2473,12 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     }
   }
 
-  const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+  const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
+  if (!sendWebhookUrl) {
+    throw new Error(`${channel} send webhook is not configured`);
+  }
+
+  const response = await fetch(sendWebhookUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2946,7 +3121,10 @@ app.post(
     let finalFileName = req.file.filename;
 
     // تحويل تسجيل المتصفح إلى OGG/Opus المتوافق مع واتساب
-    if (messageKind === "audio") {
+    if (
+      messageKind === "audio" &&
+      getConversationChannel(sessionId) === "whatsapp"
+    ) {
       const parsedName = path.parse(req.file.filename);
 
       finalFileName = `${parsedName.name}-converted.ogg`;
@@ -3042,8 +3220,15 @@ app.post(
       }
     }
 
+    const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
+    if (!sendWebhookUrl) {
+      return res.status(503).json({
+        error: `${getConversationChannel(sessionId)} send webhook is not configured`
+      });
+    }
+
     const response = await fetch(
-      process.env.N8N_SEND_WEBHOOK_URL,
+      sendWebhookUrl,
       {
         method: "POST",
 
