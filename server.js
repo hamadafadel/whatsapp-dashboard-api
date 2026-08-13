@@ -2453,6 +2453,81 @@ function mediaKindPlaceholderText(kind) {
   return null;
 }
 
+async function sendDashboardMediaToChannel({
+  sessionId,
+  caption = '',
+  messageKind,
+  fileUrl,
+  thumbnailUrl = '',
+  agentName,
+  source
+}) {
+  const channel = getConversationChannel(sessionId);
+  const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
+
+  if (!sendWebhookUrl) {
+    throw new Error(`${channel} send webhook is not configured`);
+  }
+
+  if (channel === 'messenger') {
+    console.log('ATTACH/SAVED messenger media send start', {
+      source,
+      mediaKind: messageKind,
+      fileUrl,
+      timestamp: new Date().toISOString()
+    });
+    console.log('ATTACH/SAVED messenger media before n8n', {
+      source,
+      mediaKind: messageKind,
+      fileUrl,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  const response = await fetch(sendWebhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+    },
+    body: JSON.stringify({
+      sessionId,
+      message: caption || '',
+      messageKind,
+      mediaUrl: fileUrl,
+      thumbnailUrl,
+      agentName
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const error = new Error(data.error || 'Failed to send media via n8n');
+    error.details = data;
+    throw error;
+  }
+
+  if (channel === 'messenger') {
+    console.log('ATTACH/SAVED messenger media after n8n', {
+      source,
+      mediaKind: messageKind,
+      fileUrl,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  await stampLatestAgentMessage(
+    sessionId,
+    agentName,
+    messageKind,
+    fileUrl,
+    null,
+    caption ? null : mediaKindPlaceholderText(messageKind)
+  );
+
+  return data;
+}
+
 async function sendSavedMediaToSession(item, sessionId, agentName, caption = '') {
   const channel = getConversationChannel(sessionId);
   const sizeLimit = channel === 'whatsapp'
@@ -2473,119 +2548,27 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     }
   }
 
-  const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
-  if (!sendWebhookUrl) {
-    throw new Error(`${channel} send webhook is not configured`);
-  }
-
-  let messengerAttachmentId = '';
-  if (
+  const useLocalPublicUrl =
     channel === 'messenger' &&
     (item.media_kind === 'image' || item.media_kind === 'video') &&
     item.file_path &&
-    fs.existsSync(item.file_path)
-  ) {
-    const messengerMediaKind = item.media_kind;
-    console.log(`Messenger saved ${messengerMediaKind} direct upload start`);
+    fs.existsSync(item.file_path);
+  const dashboardBaseUrl = String(
+    process.env.DASHBOARD_BASE_URL || 'https://wadashboardapi.almehrab.org'
+  ).replace(/\/$/, '');
+  const fileUrl = useLocalPublicUrl
+    ? `${dashboardBaseUrl}/uploads/${encodeURIComponent(path.basename(item.file_path))}`
+    : item.media_url;
 
-    try {
-      const mediaBuffer = await fs.promises.readFile(item.file_path);
-      const extension = path.extname(item.file_path).toLowerCase();
-      const contentType = messengerMediaKind === 'video'
-        ? extension === '.webm'
-          ? 'video/webm'
-          : extension === '.mov'
-            ? 'video/quicktime'
-            : 'video/mp4'
-        : extension === '.png'
-          ? 'image/png'
-          : extension === '.gif'
-            ? 'image/gif'
-            : extension === '.webp'
-              ? 'image/webp'
-              : 'image/jpeg';
-      const form = new FormData();
-
-      form.append(
-        'message',
-        JSON.stringify({
-          attachment: {
-            type: messengerMediaKind,
-            payload: { is_reusable: true }
-          }
-        })
-      );
-      form.append(
-        'filedata',
-        new Blob([mediaBuffer], { type: contentType }),
-        path.basename(item.file_path)
-      );
-
-      const uploadResponse = await fetch(
-        `https://graph.facebook.com/${process.env.META_GRAPH_API_VERSION || 'v26.0'}/${process.env.META_PAGE_ID}/message_attachments`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${process.env.META_PAGE_ACCESS_TOKEN || ''}`
-          },
-          body: form
-        }
-      );
-      const uploadData = await uploadResponse.json().catch(() => ({}));
-
-      if (!uploadResponse.ok || !uploadData.attachment_id) {
-        throw new Error(
-          uploadData?.error?.message || 'Messenger attachment upload failed'
-        );
-      }
-
-      messengerAttachmentId = String(uploadData.attachment_id);
-      console.log(`Messenger saved ${messengerMediaKind} direct upload success`);
-    } catch (err) {
-      console.error(
-        `Messenger saved ${messengerMediaKind} fallback to URL:`,
-        err
-      );
-      messengerAttachmentId = '';
-    }
-  }
-
-  const response = await fetch(sendWebhookUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.INTERNAL_API_TOKEN || ''
-    },
-    body: JSON.stringify({
-      sessionId,
-      message: caption || '',
-      messageKind: item.media_kind,
-      mediaUrl: item.media_url,
-      thumbnailUrl: item.thumbnail_url || '',
-      ...(channel === 'messenger' &&
-      (item.media_kind === 'image' || item.media_kind === 'video')
-        ? { attachmentId: messengerAttachmentId }
-        : {}),
-      agentName
-    })
-  });
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(data.error || 'Failed to send media via n8n');
-  }
-
-  await stampLatestAgentMessage(
+  return sendDashboardMediaToChannel({
     sessionId,
+    caption,
+    messageKind: item.media_kind,
+    fileUrl,
+    thumbnailUrl: item.thumbnail_url || '',
     agentName,
-    item.media_kind,
-    item.media_url,
-    null,
-    caption ? null : mediaKindPlaceholderText(item.media_kind)
-  );
-
-  return data;
+    source: 'saved'
+  });
 }
 
 // إرسال الوسائط المحفوظة بيشتغل كـ"جوب" في الخلفية على السيرفر نفسه، مش
@@ -3315,38 +3298,15 @@ app.post(
         queued: true
       });
 
-      fetch(sendWebhookUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": process.env.INTERNAL_API_TOKEN || ""
-        },
-        body: JSON.stringify({
-          sessionId,
-          message: caption,
-          messageKind: messengerKind,
-          mediaUrl: fileUrl,
-          thumbnailUrl,
-          agentName
-        })
+      sendDashboardMediaToChannel({
+        sessionId,
+        caption,
+        messageKind: messengerKind,
+        fileUrl,
+        thumbnailUrl,
+        agentName,
+        source: 'attach'
       })
-        .then(async (response) => {
-          const data = await response.json().catch(() => ({}));
-          if (!response.ok) {
-            const error = new Error("Failed to send Messenger media via n8n");
-            error.details = data;
-            throw error;
-          }
-
-          await stampLatestAgentMessage(
-            sessionId,
-            agentName,
-            messengerKind,
-            fileUrl,
-            null,
-            caption ? null : mediaKindPlaceholderText(messengerKind)
-          );
-        })
         .catch((err) => {
           console.error("Messenger background media send failed:", err);
         });
@@ -3354,46 +3314,23 @@ app.post(
       return;
     }
 
-    const response = await fetch(
-      sendWebhookUrl,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key":
-            process.env.INTERNAL_API_TOKEN || ""
-        },
-
-        body: JSON.stringify({
-          sessionId,
-          message: caption,
-          messageKind,
-          mediaUrl: fileUrl,
-          thumbnailUrl,
-          agentName
-        })
-      }
-    );
-
-    const data =
-      await response.json().catch(() => ({}));
-
-    if (!response.ok) {
+    let data;
+    try {
+      data = await sendDashboardMediaToChannel({
+        sessionId,
+        caption,
+        messageKind,
+        fileUrl,
+        thumbnailUrl,
+        agentName,
+        source: 'attach'
+      });
+    } catch (err) {
       return res.status(500).json({
         error: "Failed to send media via n8n",
-        details: data
+        details: err.details || { error: err.message }
       });
     }
-
-    await stampLatestAgentMessage(
-      sessionId,
-      agentName,
-      messageKind,
-      fileUrl,
-      null,
-      caption ? null : mediaKindPlaceholderText(messageKind)
-    );
 
     res.json({
       success: true,
