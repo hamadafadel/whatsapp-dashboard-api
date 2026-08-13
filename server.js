@@ -2478,6 +2478,78 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     throw new Error(`${channel} send webhook is not configured`);
   }
 
+  let messengerAttachmentId = '';
+  if (
+    channel === 'messenger' &&
+    (item.media_kind === 'image' || item.media_kind === 'video') &&
+    item.file_path &&
+    fs.existsSync(item.file_path)
+  ) {
+    const messengerMediaKind = item.media_kind;
+    console.log(`Messenger saved ${messengerMediaKind} direct upload start`);
+
+    try {
+      const mediaBuffer = await fs.promises.readFile(item.file_path);
+      const extension = path.extname(item.file_path).toLowerCase();
+      const contentType = messengerMediaKind === 'video'
+        ? extension === '.webm'
+          ? 'video/webm'
+          : extension === '.mov'
+            ? 'video/quicktime'
+            : 'video/mp4'
+        : extension === '.png'
+          ? 'image/png'
+          : extension === '.gif'
+            ? 'image/gif'
+            : extension === '.webp'
+              ? 'image/webp'
+              : 'image/jpeg';
+      const form = new FormData();
+
+      form.append(
+        'message',
+        JSON.stringify({
+          attachment: {
+            type: messengerMediaKind,
+            payload: { is_reusable: true }
+          }
+        })
+      );
+      form.append(
+        'filedata',
+        new Blob([mediaBuffer], { type: contentType }),
+        path.basename(item.file_path)
+      );
+
+      const uploadResponse = await fetch(
+        `https://graph.facebook.com/${process.env.META_GRAPH_API_VERSION || 'v26.0'}/${process.env.META_PAGE_ID}/message_attachments`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${process.env.META_PAGE_ACCESS_TOKEN || ''}`
+          },
+          body: form
+        }
+      );
+      const uploadData = await uploadResponse.json().catch(() => ({}));
+
+      if (!uploadResponse.ok || !uploadData.attachment_id) {
+        throw new Error(
+          uploadData?.error?.message || 'Messenger attachment upload failed'
+        );
+      }
+
+      messengerAttachmentId = String(uploadData.attachment_id);
+      console.log(`Messenger saved ${messengerMediaKind} direct upload success`);
+    } catch (err) {
+      console.error(
+        `Messenger saved ${messengerMediaKind} fallback to URL:`,
+        err
+      );
+      messengerAttachmentId = '';
+    }
+  }
+
   const response = await fetch(sendWebhookUrl, {
     method: 'POST',
     headers: {
@@ -2490,6 +2562,10 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
       messageKind: item.media_kind,
       mediaUrl: item.media_url,
       thumbnailUrl: item.thumbnail_url || '',
+      ...(channel === 'messenger' &&
+      (item.media_kind === 'image' || item.media_kind === 'video')
+        ? { attachmentId: messengerAttachmentId }
+        : {}),
       agentName
     })
   });
