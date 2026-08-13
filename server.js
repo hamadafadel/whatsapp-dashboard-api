@@ -482,6 +482,32 @@ ensurePushSubscriptionsTable().catch((err) => {
   console.error('Failed to ensure push_subscriptions table:', err);
 });
 
+async function ensureMessengerRawEventsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messenger_raw_events (
+      id BIGSERIAL PRIMARY KEY,
+      sender_id TEXT,
+      recipient_id TEXT,
+      event_timestamp TIMESTAMPTZ,
+      event_type TEXT NOT NULL DEFAULT 'unknown',
+      message_id TEXT,
+      is_echo BOOLEAN,
+      raw_payload JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messenger_raw_events_created_at ON messenger_raw_events (created_at)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messenger_raw_events_sender_id ON messenger_raw_events (sender_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messenger_raw_events_recipient_id ON messenger_raw_events (recipient_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messenger_raw_events_message_id ON messenger_raw_events (message_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messenger_raw_events_event_type ON messenger_raw_events (event_type)`);
+}
+
+ensureMessengerRawEventsTable().catch((err) => {
+  console.error('Failed to ensure messenger_raw_events table:', err);
+});
+
 // عمود تتبع آخر رسالة اتقرت في كل محادثة، عشان نحسب منه عدد الرسايل الجديدة
 async function ensureUnreadTrackingColumn() {
   await pool.query(`
@@ -931,14 +957,22 @@ app.post('/api/webhooks/messenger', (req, res) => {
   }
 
   const events = (Array.isArray(body.entry) ? body.entry : [])
-    .flatMap((entry) =>
-      (Array.isArray(entry.messaging) ? entry.messaging : []).map((event) => ({
+    .flatMap((entry) => [
+      ...(Array.isArray(entry.messaging) ? entry.messaging : []).map((event) => ({
         object: body.object,
         pageId: String(entry.id || ''),
         entryTime: entry.time || null,
+        eventSource: 'messaging',
+        event
+      })),
+      ...(Array.isArray(entry.standby) ? entry.standby : []).map((event) => ({
+        object: body.object,
+        pageId: String(entry.id || ''),
+        entryTime: entry.time || null,
+        eventSource: 'standby',
         event
       }))
-    );
+    ]);
 
   for (const item of events) {
     const psid = String(item.event?.sender?.id || '');
