@@ -3227,6 +3227,57 @@ app.post(
       });
     }
 
+    if (getConversationChannel(sessionId) === "messenger") {
+      const messengerKind = messageKind;
+
+      res.json({
+        success: true,
+        channel: "messenger",
+        url: fileUrl,
+        thumbnailUrl,
+        messageKind: messengerKind,
+        queued: true
+      });
+
+      fetch(sendWebhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.INTERNAL_API_TOKEN || ""
+        },
+        body: JSON.stringify({
+          sessionId,
+          message: caption,
+          messageKind: messengerKind,
+          mediaUrl: fileUrl,
+          thumbnailUrl,
+          agentName
+        })
+      })
+        .then(async (response) => {
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            const error = new Error("Failed to send Messenger media via n8n");
+            error.details = data;
+            throw error;
+          }
+
+          await stampLatestAgentMessage(
+            sessionId,
+            agentName,
+            messengerKind,
+            fileUrl,
+            null,
+            caption ? null : mediaKindPlaceholderText(messengerKind)
+          );
+        })
+        .catch((err) => {
+          console.error("Messenger background media send failed:", err);
+        });
+
+      return;
+    }
+
     const response = await fetch(
       sendWebhookUrl,
       {
