@@ -442,6 +442,11 @@ async function ensureSavedMediaTables() {
   await pool.query(`
     ALTER TABLE saved_media_items ADD COLUMN IF NOT EXISTS sort_order DOUBLE PRECISION
   `);
+
+  await pool.query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_saved_media_items_folder_order
+    ON saved_media_items (folder_id, sort_order, id)
+  `);
 }
 
 ensureSavedMediaTables().catch((err) => {
@@ -525,6 +530,35 @@ ensureUnreadTrackingColumn().catch((err) => {
   console.error('Failed to ensure last_read_message_id/hidden columns:', err);
 });
 
+async function ensureChatPerformanceIndexes() {
+  await pool.query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chat_memory_session_id_id_desc
+    ON chat_memory (session_id, id DESC)
+  `);
+
+  await pool.query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chat_memory_user_session_id_desc
+    ON chat_memory (session_id, id DESC)
+    WHERE message->>'type' = 'user'
+  `);
+
+  await pool.query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chat_memory_customer_name_session_id_desc
+    ON chat_memory (session_id, id DESC)
+    WHERE COALESCE(message->>'customer_name', '') <> ''
+  `);
+
+  await pool.query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chat_memory_media_session_id_desc
+    ON chat_memory (session_id, id DESC)
+    WHERE message->>'message_kind' IN ('image', 'video')
+  `);
+}
+
+ensureChatPerformanceIndexes().catch((err) => {
+  console.error('Failed to ensure chat performance indexes:', err);
+});
+
 async function ensureLabelsTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conversation_labels (
@@ -544,6 +578,11 @@ async function ensureLabelsTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(session_id, label_id)
     )
+  `);
+
+  await pool.query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conversation_label_assignments_session
+    ON conversation_label_assignments (session_id, label_id)
   `);
 }
 
@@ -677,6 +716,44 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
 
     const result = await pool.query(
       `
+      WITH latest AS (
+        SELECT DISTINCT ON (session_id)
+          session_id,
+          message->>'content' AS content,
+          message->>'type' AS type,
+          message->>'message_kind' AS message_kind,
+          message->>'channel' AS channel,
+          id
+        FROM chat_memory
+        ORDER BY session_id, id DESC
+      ),
+      names AS (
+        SELECT DISTINCT ON (session_id)
+          session_id,
+          message->>'customer_name' AS customer_name
+        FROM chat_memory
+        WHERE COALESCE(message->>'customer_name', '') <> ''
+        ORDER BY session_id, id DESC
+      ),
+      unread AS (
+        SELECT cm.session_id, COUNT(*)::int AS unread_count
+        FROM chat_memory cm
+        LEFT JOIN chat_sessions cs ON cs.session_id = cm.session_id
+        WHERE cm.message->>'type' = 'user'
+          AND cm.id > COALESCE(cs.last_read_message_id, 0)
+        GROUP BY cm.session_id
+      ),
+      labels_agg AS (
+        SELECT
+          cla.session_id,
+          json_agg(
+            json_build_object('id', cl.id, 'name', cl.name, 'color', cl.color)
+            ORDER BY cl.id
+          ) AS labels
+        FROM conversation_label_assignments cla
+        JOIN conversation_labels cl ON cl.id = cla.label_id
+        GROUP BY cla.session_id
+      )
       SELECT
         latest.session_id,
         CASE
@@ -691,45 +768,10 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         COALESCE(unread.unread_count, 0) AS unread_count,
         COALESCE(labels_agg.labels, '[]') AS labels,
         COALESCE(sess.hidden, false) AS hidden
-      FROM (
-        SELECT DISTINCT ON (session_id)
-          session_id,
-          message->>'content' AS content,
-          message->>'type' AS type,
-          message->>'message_kind' AS message_kind,
-          message->>'channel' AS channel,
-          id
-        FROM chat_memory
-        ORDER BY session_id, id DESC
-      ) latest
-      LEFT JOIN (
-        SELECT DISTINCT ON (session_id)
-          session_id,
-          message->>'customer_name' AS customer_name
-        FROM chat_memory
-        WHERE COALESCE(message->>'customer_name', '') <> ''
-        ORDER BY session_id, id DESC
-      ) names
-      ON latest.session_id = names.session_id
-      LEFT JOIN LATERAL (
-        SELECT COUNT(*)::int AS unread_count
-        FROM chat_memory cm
-        WHERE cm.session_id = latest.session_id
-          AND cm.message->>'type' = 'user'
-          AND cm.id > COALESCE(
-            (SELECT cs.last_read_message_id FROM chat_sessions cs WHERE cs.session_id = latest.session_id),
-            0
-          )
-      ) unread ON true
-      LEFT JOIN LATERAL (
-        SELECT json_agg(
-          json_build_object('id', cl.id, 'name', cl.name, 'color', cl.color)
-          ORDER BY cl.id
-        ) AS labels
-        FROM conversation_label_assignments cla
-        JOIN conversation_labels cl ON cl.id = cla.label_id
-        WHERE cla.session_id = latest.session_id
-      ) labels_agg ON true
+      FROM latest
+      LEFT JOIN names ON latest.session_id = names.session_id
+      LEFT JOIN unread ON latest.session_id = unread.session_id
+      LEFT JOIN labels_agg ON latest.session_id = labels_agg.session_id
       LEFT JOIN chat_sessions sess ON sess.session_id = latest.session_id
       WHERE COALESCE(sess.hidden, false) = $1
       ORDER BY latest.id DESC
