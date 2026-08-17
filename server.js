@@ -790,6 +790,41 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
 });
 
 // رسائل محادثة واحدة
+// Search across the complete conversation history, not only the latest preview.
+app.get('/api/conversations-search', requireAuth, async (req, res) => {
+  const query = String(req.query.q || '').trim();
+
+  if (!query) {
+    return res.json({ sessionIds: [] });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT cm.session_id
+      FROM chat_memory cm
+      WHERE cm.session_id ILIKE $1
+         OR COALESCE(cm.message->>'customer_name', '') ILIKE $1
+         OR COALESCE(cm.message->>'content', '') ILIKE $1
+      GROUP BY cm.session_id
+      ORDER BY MAX(cm.id) DESC
+      LIMIT 500
+      `,
+      [`%${query}%`]
+    );
+
+    res.json({
+      sessionIds: result.rows.map((row) => row.session_id)
+    });
+  } catch (err) {
+    console.error('Conversation search error:', err);
+    res.status(500).json({
+      error: 'Error searching conversations',
+      details: err.message
+    });
+  }
+});
+
 app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
   const { sessionId } = req.params;
   const limit = Math.min(
