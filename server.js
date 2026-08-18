@@ -160,11 +160,15 @@ app.use(
     lastModified: true,
     maxAge: '365d',
     immutable: true,
-    setHeaders(res) {
+    setHeaders(res, filePath) {
       res.setHeader(
         'Cache-Control',
         'public, max-age=31536000, immutable'
       );
+
+      if (path.extname(filePath).toLowerCase() === '.mp3') {
+        res.setHeader('Content-Type', 'audio/mpeg');
+      }
     }
   })
 );
@@ -3361,6 +3365,77 @@ app.post(
       }
 
       // حذف النسخة الأصلية بعد نجاح التحويل
+      if (
+        originalFilePath !== finalFilePath &&
+        fs.existsSync(originalFilePath)
+      ) {
+        fs.unlinkSync(originalFilePath);
+      }
+    }
+
+    // Messenger rejects some browser-recorded WebM variants. Convert only
+    // dashboard microphone recordings for Messenger; WhatsApp stays untouched.
+    if (
+      messageKind === "audio" &&
+      getConversationChannel(sessionId) === "messenger" &&
+      String(req.body.isVoiceRecording || "").toLowerCase() === "true"
+    ) {
+      const parsedName = path.parse(req.file.filename);
+
+      finalFileName = `${parsedName.name}-converted.mp3`;
+      finalFilePath = path.join(uploadsDir, finalFileName);
+
+      await execFileAsync("ffmpeg", [
+        "-y",
+        "-fflags",
+        "+genpts",
+        "-i",
+        originalFilePath,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "96k",
+        "-ar",
+        "44100",
+        "-ac",
+        "1",
+        "-id3v2_version",
+        "3",
+        "-f",
+        "mp3",
+        finalFilePath
+      ]);
+
+      const { stdout: audioProbeOutput } =
+        await execFileAsync("ffprobe", [
+          "-v",
+          "error",
+          "-select_streams",
+          "a:0",
+          "-show_entries",
+          "stream=codec_name:format=duration",
+          "-of",
+          "json",
+          finalFilePath
+        ]);
+
+      const audioProbe = JSON.parse(audioProbeOutput || "{}");
+      const audioStream = audioProbe.streams?.[0] || {};
+      const audioDuration = Number(audioProbe.format?.duration || 0);
+      const audioFileSize = fs.statSync(finalFilePath).size;
+
+      if (
+        audioStream.codec_name !== "mp3" ||
+        !Number.isFinite(audioDuration) ||
+        audioDuration <= 0 ||
+        audioFileSize <= 0
+      ) {
+        throw new Error("Invalid Messenger MP3 after conversion");
+      }
+
       if (
         originalFilePath !== finalFilePath &&
         fs.existsSync(originalFilePath)
