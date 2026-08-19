@@ -245,6 +245,10 @@ const DASHBOARD_GALLERY_USERNAME =
   process.env.DASHBOARD_GALLERY_USERNAME || '';
 const DASHBOARD_GALLERY_PASSWORD =
   process.env.DASHBOARD_GALLERY_PASSWORD || '';
+const DASHBOARD_CONFIRMATION_USERNAME =
+  process.env.DASHBOARD_CONFIRMATION_USERNAME || '';
+const DASHBOARD_CONFIRMATION_PASSWORD =
+  process.env.DASHBOARD_CONFIRMATION_PASSWORD || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || '';
 const META_APP_SECRET = process.env.META_APP_SECRET || '';
@@ -301,6 +305,18 @@ function findDashboardAccount(username, password) {
     });
   }
 
+  if (
+    DASHBOARD_CONFIRMATION_USERNAME &&
+    DASHBOARD_CONFIRMATION_PASSWORD
+  ) {
+    accounts.push({
+      username: DASHBOARD_CONFIRMATION_USERNAME,
+      password: DASHBOARD_CONFIRMATION_PASSWORD,
+      role: 'confirmation',
+      displayName: 'Confirmation1'
+    });
+  }
+
   return accounts.find(
     (account) =>
       account.username === username &&
@@ -330,6 +346,16 @@ function requireAuth(req, res, next) {
 function requireAdmin(req, res, next) {
   if (req.user?.role !== 'admin') {
     return res.status(403).json({ error: 'Admins only' });
+  }
+
+  next();
+}
+
+function requireConfirmationAccess(req, res, next) {
+  if (!['admin', 'confirmation'].includes(req.user?.role)) {
+    return res.status(403).json({
+      error: 'Order confirmation access only'
+    });
   }
 
   next();
@@ -2261,6 +2287,156 @@ app.post('/api/send-template', requireAuth, async (req, res) => {
     });
   }
 });
+
+function buildOrderConfirmationPreview(orderData) {
+  return [
+    `أهلا أ.${orderData.name}، شكرا لشرائكم من المحراب 🌺`,
+    'https://almehrab.org/',
+    '',
+    `هذه رسالة تأكيد لطلب سيادتكم رقم ${orderData.order}`,
+    '',
+    'الطلب:',
+    orderData.items,
+    '',
+    'بيانات الشحن:',
+    orderData.name,
+    orderData.address,
+    `ت/ ${orderData.contact}`,
+    '',
+    `إجمالي الطلب: ${orderData.total} شامل الشحن`,
+    '',
+    'يرجى مراجعة بيانات الطلب والشحن أعلاه:',
+    '',
+    'إذا كانت جميع البيانات صحيحة، اضغط على زر "تأكيد الطلب".',
+    '',
+    'وإذا كنت ترغب في إضافة أو تعديل أي بيانات، اضغط على زر "إضافة أو تعديل بيانات".',
+    '',
+    'ولكم جزيل الشكر 🌺'
+  ].join('\n');
+}
+
+app.post(
+  '/api/send-order-confirmation',
+  requireAuth,
+  requireConfirmationAccess,
+  async (req, res) => {
+    try {
+      const source = req.body || {};
+      const phone = String(source.phone || '')
+        .trim()
+        .replace(/[\s()+-]/g, '');
+      const orderData = {
+        phone,
+        name: String(source.name || '').trim(),
+        order: String(source.order || '').trim(),
+        items: String(source.items || '').trim(),
+        address: String(source.address || '').trim(),
+        contact: String(source.contact || '').trim(),
+        total: String(source.total || '').trim()
+      };
+
+      const missingFields = Object.entries(orderData)
+        .filter(([, value]) => !value)
+        .map(([key]) => key);
+
+      if (missingFields.length) {
+        return res.status(400).json({
+          error: `Missing required order data: ${missingFields.join(', ')}`
+        });
+      }
+
+      if (!/^\d{8,15}$/.test(phone)) {
+        return res.status(400).json({
+          error: 'WhatsApp phone must be an international number containing 8 to 15 digits'
+        });
+      }
+
+      const fieldLimits = {
+        name: 300,
+        order: 200,
+        items: 5000,
+        address: 2000,
+        contact: 300,
+        total: 300
+      };
+
+      const oversizedField = Object.entries(fieldLimits).find(
+        ([key, limit]) => orderData[key].length > limit
+      );
+
+      if (oversizedField) {
+        return res.status(400).json({
+          error: `${oversizedField[0]} is too long`
+        });
+      }
+
+      if (!process.env.N8N_SEND_WEBHOOK_URL) {
+        return res.status(503).json({
+          error: 'WhatsApp send workflow is not configured'
+        });
+      }
+
+      const templateParameters = [
+        orderData.name,
+        orderData.order,
+        orderData.items,
+        orderData.address,
+        orderData.contact,
+        orderData.total,
+        orderData.name
+      ];
+      const templatePreview = buildOrderConfirmationPreview(orderData);
+      const agentName =
+        req.user?.displayName || req.user?.username || 'Agent';
+
+      const response = await fetch(process.env.N8N_SEND_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.INTERNAL_API_TOKEN || ''
+        },
+        body: JSON.stringify({
+          sessionId: phone,
+          messageKind: 'dashboard_action',
+          actionId: 'send_template',
+          actionLabel: 'تأكيد الطلب',
+          templateId: 'order_confirmation',
+          templateName: 'order_confirmation',
+          templateLanguage: 'ar',
+          templateMessageKind: 'template',
+          templateParameters,
+          templatePreview,
+          agentName
+        })
+      });
+
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        const workflowError =
+          data.error || data.message || data.details?.message ||
+          'Failed to send order confirmation via n8n';
+
+        return res.status(502).json({
+          error: workflowError,
+          details: data
+        });
+      }
+
+      res.json({
+        success: true,
+        sessionId: phone,
+        templateName: 'order_confirmation',
+        data
+      });
+    } catch (err) {
+      console.error('send-order-confirmation error:', err);
+      res.status(500).json({
+        error: err.message || 'Internal server error'
+      });
+    }
+  }
+);
 
 // جلب حالة AI
 app.get('/api/ai-status/:sessionId', requireAuth, async (req, res) => {
