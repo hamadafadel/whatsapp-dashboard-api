@@ -583,6 +583,13 @@ async function ensureChatPerformanceIndexes() {
     ON chat_memory (session_id, id DESC)
     WHERE message->>'message_kind' IN ('image', 'video')
   `);
+
+  await pool.query(`
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chat_memory_order_confirmation_session
+    ON chat_memory (session_id)
+    WHERE message->>'message_kind' = 'template'
+      AND message->>'template_name' = 'order_confirmation'
+  `);
 }
 
 ensureChatPerformanceIndexes().catch((err) => {
@@ -783,6 +790,12 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         FROM conversation_label_assignments cla
         JOIN conversation_labels cl ON cl.id = cla.label_id
         GROUP BY cla.session_id
+      ),
+      confirmation_sessions AS (
+        SELECT DISTINCT session_id
+        FROM chat_memory
+        WHERE message->>'message_kind' = 'template'
+          AND message->>'template_name' = 'order_confirmation'
       )
       SELECT
         latest.session_id,
@@ -796,17 +809,21 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         names.customer_name,
         latest.id,
         COALESCE(unread.unread_count, 0) AS unread_count,
+        (confirmation_sessions.session_id IS NOT NULL) AS is_confirmation,
         COALESCE(labels_agg.labels, '[]') AS labels,
         COALESCE(sess.hidden, false) AS hidden
       FROM latest
       LEFT JOIN names ON latest.session_id = names.session_id
       LEFT JOIN unread ON latest.session_id = unread.session_id
       LEFT JOIN labels_agg ON latest.session_id = labels_agg.session_id
+      LEFT JOIN confirmation_sessions
+        ON latest.session_id = confirmation_sessions.session_id
       LEFT JOIN chat_sessions sess ON sess.session_id = latest.session_id
       WHERE COALESCE(sess.hidden, false) = $1
+        AND ($2::boolean = false OR confirmation_sessions.session_id IS NOT NULL)
       ORDER BY latest.id DESC
       `,
-      [wantHidden]
+      [wantHidden, req.user?.role === 'confirmation']
     );
 
     res.json(result.rows);
@@ -818,6 +835,20 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
     });
   }
 });
+
+async function isOrderConfirmationSession(sessionId) {
+  const result = await pool.query(
+    `SELECT 1
+     FROM chat_memory
+     WHERE session_id = $1
+       AND message->>'message_kind' = 'template'
+       AND message->>'template_name' = 'order_confirmation'
+     LIMIT 1`,
+    [sessionId]
+  );
+
+  return result.rows.length > 0;
+}
 
 // رسائل محادثة واحدة
 // Search across the complete conversation history, not only the latest preview.
@@ -833,14 +864,26 @@ app.get('/api/conversations-search', requireAuth, async (req, res) => {
       `
       SELECT cm.session_id
       FROM chat_memory cm
-      WHERE cm.session_id ILIKE $1
-         OR COALESCE(cm.message->>'customer_name', '') ILIKE $1
-         OR COALESCE(cm.message->>'content', '') ILIKE $1
+      WHERE (
+        cm.session_id ILIKE $1
+        OR COALESCE(cm.message->>'customer_name', '') ILIKE $1
+        OR COALESCE(cm.message->>'content', '') ILIKE $1
+      )
+        AND (
+          $2::boolean = false
+          OR EXISTS (
+            SELECT 1
+            FROM chat_memory confirmation
+            WHERE confirmation.session_id = cm.session_id
+              AND confirmation.message->>'message_kind' = 'template'
+              AND confirmation.message->>'template_name' = 'order_confirmation'
+          )
+        )
       GROUP BY cm.session_id
       ORDER BY MAX(cm.id) DESC
       LIMIT 500
       `,
-      [`%${query}%`]
+      [`%${query}%`, req.user?.role === 'confirmation']
     );
 
     res.json({
@@ -866,6 +909,15 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
     : null;
 
   try {
+    if (
+      req.user?.role === 'confirmation' &&
+      !(await isOrderConfirmationSession(sessionId))
+    ) {
+      return res.status(403).json({
+        error: 'Forbidden: this session is not an order confirmation conversation'
+      });
+    }
+
     const [result, countResult] = await Promise.all([
       pool.query(
       `
@@ -926,6 +978,15 @@ app.get('/api/media/:sessionId', requireAuth, async (req, res) => {
     : null;
 
   try {
+    if (
+      req.user?.role === 'confirmation' &&
+      !(await isOrderConfirmationSession(sessionId))
+    ) {
+      return res.status(403).json({
+        error: 'Forbidden: this session is not an order confirmation conversation'
+      });
+    }
+
     const [result, countResult] = await Promise.all([
       pool.query(
         `
