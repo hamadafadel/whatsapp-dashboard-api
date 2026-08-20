@@ -827,6 +827,14 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         FROM chat_memory
         WHERE message->>'message_kind' = 'template'
           AND message->>'template_name' = 'order_confirmation'
+      ),
+      visibility_agg AS (
+        SELECT
+          session_id,
+          array_agg(username ORDER BY username) AS hidden_for_usernames
+        FROM conversation_user_visibility
+        WHERE is_hidden = true
+        GROUP BY session_id
       )
       SELECT
         latest.session_id,
@@ -842,7 +850,8 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
         COALESCE(unread.unread_count, 0) AS unread_count,
         (confirmation_sessions.session_id IS NOT NULL) AS is_confirmation,
         COALESCE(labels_agg.labels, '[]') AS labels,
-        COALESCE(sess.hidden, false) AS hidden
+        COALESCE(sess.hidden, false) AS hidden,
+        COALESCE(visibility_agg.hidden_for_usernames, ARRAY[]::text[]) AS hidden_for_usernames
       FROM latest
       LEFT JOIN names ON latest.session_id = names.session_id
       LEFT JOIN unread ON latest.session_id = unread.session_id
@@ -850,13 +859,26 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
       LEFT JOIN confirmation_sessions
         ON latest.session_id = confirmation_sessions.session_id
       LEFT JOIN chat_sessions sess ON sess.session_id = latest.session_id
+      LEFT JOIN visibility_agg ON visibility_agg.session_id = latest.session_id
       LEFT JOIN conversation_user_visibility user_visibility
         ON user_visibility.session_id = latest.session_id
        AND user_visibility.username = $3
        AND user_visibility.is_hidden = true
-      WHERE COALESCE(sess.hidden, false) = $1
-        AND ($2::boolean = false OR confirmation_sessions.session_id IS NOT NULL)
-        AND ($4::boolean = true OR user_visibility.session_id IS NULL)
+      WHERE ($2::boolean = false OR confirmation_sessions.session_id IS NOT NULL)
+        AND (
+          (
+            $1::boolean = true
+            AND (
+              COALESCE(sess.hidden, false) = true
+              OR visibility_agg.session_id IS NOT NULL
+            )
+          )
+          OR (
+            $1::boolean = false
+            AND COALESCE(sess.hidden, false) = false
+            AND ($4::boolean = true OR user_visibility.session_id IS NULL)
+          )
+        )
       ORDER BY latest.id DESC
       `,
       [
@@ -867,7 +889,18 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
       ]
     );
 
-    res.json(result.rows);
+    const visibilityUsers = new Map(
+      getConversationVisibilityUsers().map((user) => [user.username, user])
+    );
+    res.json(
+      result.rows.map((row) => ({
+        ...row,
+        hidden_for: (row.hidden_for_usernames || []).map((username) => ({
+          username,
+          displayName: visibilityUsers.get(username)?.displayName || username
+        }))
+      }))
+    );
   } catch (err) {
     console.error('Conversations error:', err);
     res.status(500).json({
