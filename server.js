@@ -277,7 +277,7 @@ if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   console.warn('VAPID keys not set — push notifications are disabled.');
 }
 
-function findDashboardAccount(username, password) {
+function getDashboardAccounts() {
   const accounts = [
     {
       username: DASHBOARD_USERNAME,
@@ -317,11 +317,21 @@ function findDashboardAccount(username, password) {
     });
   }
 
-  return accounts.find(
+  return accounts;
+}
+
+function findDashboardAccount(username, password) {
+  return getDashboardAccounts().find(
     (account) =>
       account.username === username &&
       account.password === password
   ) || null;
+}
+
+function getConversationVisibilityUsers() {
+  return getDashboardAccounts()
+    .filter((account) => ['agent', 'confirmation'].includes(account.role))
+    .map(({ username, role, displayName }) => ({ username, role, displayName }));
 }
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || '';
@@ -515,6 +525,27 @@ async function ensurePushSubscriptionsTable() {
 
 ensurePushSubscriptionsTable().catch((err) => {
   console.error('Failed to ensure push_subscriptions table:', err);
+});
+
+async function ensureConversationUserVisibilityTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversation_user_visibility (
+      session_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      is_hidden BOOLEAN NOT NULL DEFAULT true,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (session_id, username)
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_conversation_user_visibility_username_hidden
+    ON conversation_user_visibility (username, is_hidden, session_id)
+  `);
+}
+
+ensureConversationUserVisibilityTable().catch((err) => {
+  console.error('Failed to ensure conversation_user_visibility table:', err);
 });
 
 async function ensureMessengerRawEventsTable() {
@@ -819,11 +850,21 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
       LEFT JOIN confirmation_sessions
         ON latest.session_id = confirmation_sessions.session_id
       LEFT JOIN chat_sessions sess ON sess.session_id = latest.session_id
+      LEFT JOIN conversation_user_visibility user_visibility
+        ON user_visibility.session_id = latest.session_id
+       AND user_visibility.username = $3
+       AND user_visibility.is_hidden = true
       WHERE COALESCE(sess.hidden, false) = $1
         AND ($2::boolean = false OR confirmation_sessions.session_id IS NOT NULL)
+        AND ($4::boolean = true OR user_visibility.session_id IS NULL)
       ORDER BY latest.id DESC
       `,
-      [wantHidden, req.user?.role === 'confirmation']
+      [
+        wantHidden,
+        req.user?.role === 'confirmation',
+        req.user?.username || '',
+        req.user?.role === 'admin'
+      ]
     );
 
     res.json(result.rows);
@@ -849,6 +890,87 @@ async function isOrderConfirmationSession(sessionId) {
 
   return result.rows.length > 0;
 }
+
+async function isConversationHiddenForUser(sessionId, username) {
+  if (!sessionId || !username) return false;
+
+  const result = await pool.query(
+    `SELECT 1
+     FROM conversation_user_visibility
+     WHERE session_id = $1
+       AND username = $2
+       AND is_hidden = true
+     LIMIT 1`,
+    [sessionId, username]
+  );
+
+  return result.rows.length > 0;
+}
+
+app.get('/api/conversations/:sessionId/visibility', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const users = getConversationVisibilityUsers();
+    const result = await pool.query(
+      `SELECT username
+       FROM conversation_user_visibility
+       WHERE session_id = $1 AND is_hidden = true`,
+      [req.params.sessionId]
+    );
+    const hiddenFor = new Set(result.rows.map((row) => row.username));
+
+    res.json({
+      sessionId: req.params.sessionId,
+      users: users.map((user) => ({ ...user, hidden: hiddenFor.has(user.username) })),
+      hiddenFor: users
+        .filter((user) => hiddenFor.has(user.username))
+        .map((user) => user.username)
+    });
+  } catch (err) {
+    console.error('Conversation visibility fetch error:', err);
+    res.status(500).json({ error: 'Error fetching conversation visibility' });
+  }
+});
+
+app.post('/api/conversations/:sessionId/visibility', requireAuth, requireAdmin, async (req, res) => {
+  const sessionId = String(req.params.sessionId || '').trim();
+  const requested = Array.isArray(req.body?.hiddenFor)
+    ? [...new Set(req.body.hiddenFor.map((value) => String(value || '').trim()).filter(Boolean))]
+    : null;
+  const allowedUsers = getConversationVisibilityUsers();
+  const allowedUsernames = new Set(allowedUsers.map((user) => user.username));
+
+  if (!requested || requested.some((username) => !allowedUsernames.has(username))) {
+    return res.status(400).json({ error: 'Invalid visibility username' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      'DELETE FROM conversation_user_visibility WHERE session_id = $1',
+      [sessionId]
+    );
+
+    if (requested.length) {
+      await client.query(
+        `INSERT INTO conversation_user_visibility (session_id, username, is_hidden, updated_at)
+         SELECT $1, username, true, now()
+         FROM unnest($2::text[]) AS username`,
+        [sessionId, requested]
+      );
+    }
+
+    await client.query('COMMIT');
+    broadcastConversationsChanged();
+    res.json({ success: true, sessionId, hiddenFor: requested });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Conversation visibility update error:', err);
+    res.status(500).json({ error: 'Error updating conversation visibility' });
+  } finally {
+    client.release();
+  }
+});
 
 // رسائل محادثة واحدة
 // Search across the complete conversation history, not only the latest preview.
@@ -879,11 +1001,26 @@ app.get('/api/conversations-search', requireAuth, async (req, res) => {
               AND confirmation.message->>'template_name' = 'order_confirmation'
           )
         )
+        AND (
+          $3::boolean = true
+          OR NOT EXISTS (
+            SELECT 1
+            FROM conversation_user_visibility visibility
+            WHERE visibility.session_id = cm.session_id
+              AND visibility.username = $4
+              AND visibility.is_hidden = true
+          )
+        )
       GROUP BY cm.session_id
       ORDER BY MAX(cm.id) DESC
       LIMIT 500
       `,
-      [`%${query}%`, req.user?.role === 'confirmation']
+      [
+        `%${query}%`,
+        req.user?.role === 'confirmation',
+        req.user?.role === 'admin',
+        req.user?.username || ''
+      ]
     );
 
     res.json({
@@ -909,6 +1046,13 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
     : null;
 
   try {
+    if (
+      req.user?.role !== 'admin' &&
+      await isConversationHiddenForUser(sessionId, req.user?.username)
+    ) {
+      return res.status(403).json({ error: 'Forbidden: conversation is hidden for this user' });
+    }
+
     if (
       req.user?.role === 'confirmation' &&
       !(await isOrderConfirmationSession(sessionId))
@@ -978,6 +1122,13 @@ app.get('/api/media/:sessionId', requireAuth, async (req, res) => {
     : null;
 
   try {
+    if (
+      req.user?.role !== 'admin' &&
+      await isConversationHiddenForUser(sessionId, req.user?.username)
+    ) {
+      return res.status(403).json({ error: 'Forbidden: conversation is hidden for this user' });
+    }
+
     if (
       req.user?.role === 'confirmation' &&
       !(await isOrderConfirmationSession(sessionId))
@@ -1281,6 +1432,13 @@ async function sendPushToAllSubscriptions(payload, options = {}) {
     console.log(
       `sendPushToAllSubscriptions: hidden conversation, restricting to admin subscriptions (${rows.length}/${before})`
     );
+  } else if (Array.isArray(options.hiddenUsernames) && options.hiddenUsernames.length) {
+    const hiddenUsernames = new Set(options.hiddenUsernames);
+    rows = rows.filter(
+      (row) =>
+        row.created_by === DASHBOARD_USERNAME ||
+        !hiddenUsernames.has(row.created_by)
+    );
   }
 
   console.log(
@@ -1340,6 +1498,12 @@ async function sendNewMessagePush(sessionId, payload) {
   console.log(`sendNewMessagePush: triggered for session ${sessionId}`);
 
   const hidden = await isConversationHidden(sessionId);
+  const visibilityResult = await pool.query(
+    `SELECT username
+     FROM conversation_user_visibility
+     WHERE session_id = $1 AND is_hidden = true`,
+    [sessionId]
+  );
   const customerName = (await getCustomerNameForSession(sessionId)) || 'عميل';
   const body = buildPushBodyText(payload);
 
@@ -1350,7 +1514,10 @@ async function sendNewMessagePush(sessionId, payload) {
       sessionId,
       url: '/'
     },
-    { adminOnly: hidden }
+    {
+      adminOnly: hidden,
+      hiddenUsernames: visibilityResult.rows.map((row) => row.username)
+    }
   );
 }
 
@@ -1406,7 +1573,10 @@ app.post('/api/push-subscribe', requireAuth, async (req, res) => {
       `INSERT INTO push_subscriptions (endpoint, p256dh, auth, created_by)
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (endpoint)
-       DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`,
+       DO UPDATE SET
+         p256dh = EXCLUDED.p256dh,
+         auth = EXCLUDED.auth,
+         created_by = EXCLUDED.created_by`,
       [endpoint, keys.p256dh, keys.auth, createdBy]
     );
 
