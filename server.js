@@ -328,6 +328,12 @@ function findDashboardAccount(username, password) {
   ) || null;
 }
 
+function findDashboardAccountByUsername(username) {
+  return getDashboardAccounts().find(
+    (account) => account.username === String(username || '')
+  ) || null;
+}
+
 function getConversationVisibilityUsers() {
   return getDashboardAccounts()
     .filter((account) => ['agent', 'confirmation'].includes(account.role))
@@ -910,34 +916,48 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
   }
 });
 
-async function isOrderConfirmationSession(sessionId) {
+async function getConversationAccessState(sessionId) {
   const result = await pool.query(
-    `SELECT 1
-     FROM chat_memory
-     WHERE session_id = $1
-       AND message->>'message_kind' = 'template'
-       AND message->>'template_name' = 'order_confirmation'
-     LIMIT 1`,
+    `SELECT
+       EXISTS (
+         SELECT 1
+         FROM chat_sessions
+         WHERE session_id = $1 AND COALESCE(hidden, false) = true
+       ) AS globally_hidden,
+       EXISTS (
+         SELECT 1
+         FROM chat_memory
+         WHERE session_id = $1
+           AND message->>'message_kind' = 'template'
+           AND message->>'template_name' = 'order_confirmation'
+       ) AS is_confirmation,
+       COALESCE(
+         (
+           SELECT array_agg(username)
+           FROM conversation_user_visibility
+           WHERE session_id = $1 AND is_hidden = true
+         ),
+         ARRAY[]::text[]
+       ) AS hidden_for_usernames`,
     [sessionId]
   );
 
-  return result.rows.length > 0;
+  const row = result.rows[0] || {};
+  return {
+    globallyHidden: Boolean(row.globally_hidden),
+    isConfirmation: Boolean(row.is_confirmation),
+    hiddenForUsernames: new Set(row.hidden_for_usernames || [])
+  };
 }
 
-async function isConversationHiddenForUser(sessionId, username) {
-  if (!sessionId || !username) return false;
-
-  const result = await pool.query(
-    `SELECT 1
-     FROM conversation_user_visibility
-     WHERE session_id = $1
-       AND username = $2
-       AND is_hidden = true
-     LIMIT 1`,
-    [sessionId, username]
-  );
-
-  return result.rows.length > 0;
+function canDashboardUserAccessConversation(user, accessState) {
+  if (!user || !accessState) return false;
+  if (user.role === 'admin') return true;
+  if (!['agent', 'confirmation'].includes(user.role)) return false;
+  if (accessState.globallyHidden) return false;
+  if (accessState.hiddenForUsernames.has(user.username)) return false;
+  if (user.role === 'confirmation' && !accessState.isConfirmation) return false;
+  return true;
 }
 
 app.get('/api/conversations/:sessionId/visibility', requireAuth, requireAdmin, async (req, res) => {
@@ -1079,19 +1099,10 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
     : null;
 
   try {
-    if (
-      req.user?.role !== 'admin' &&
-      await isConversationHiddenForUser(sessionId, req.user?.username)
-    ) {
-      return res.status(403).json({ error: 'Forbidden: conversation is hidden for this user' });
-    }
-
-    if (
-      req.user?.role === 'confirmation' &&
-      !(await isOrderConfirmationSession(sessionId))
-    ) {
+    const accessState = await getConversationAccessState(sessionId);
+    if (!canDashboardUserAccessConversation(req.user, accessState)) {
       return res.status(403).json({
-        error: 'Forbidden: this session is not an order confirmation conversation'
+        error: 'Forbidden: conversation is not available for this user'
       });
     }
 
@@ -1155,19 +1166,10 @@ app.get('/api/media/:sessionId', requireAuth, async (req, res) => {
     : null;
 
   try {
-    if (
-      req.user?.role !== 'admin' &&
-      await isConversationHiddenForUser(sessionId, req.user?.username)
-    ) {
-      return res.status(403).json({ error: 'Forbidden: conversation is hidden for this user' });
-    }
-
-    if (
-      req.user?.role === 'confirmation' &&
-      !(await isOrderConfirmationSession(sessionId))
-    ) {
+    const accessState = await getConversationAccessState(sessionId);
+    if (!canDashboardUserAccessConversation(req.user, accessState)) {
       return res.status(403).json({
-        error: 'Forbidden: this session is not an order confirmation conversation'
+        error: 'Forbidden: conversation is not available for this user'
       });
     }
 
@@ -1433,19 +1435,6 @@ async function getCustomerNameForSession(sessionId) {
   }
 }
 
-async function isConversationHidden(sessionId) {
-  try {
-    const result = await pool.query(
-      `SELECT hidden FROM chat_sessions WHERE session_id = $1`,
-      [sessionId]
-    );
-
-    return Boolean(result.rows[0]?.hidden);
-  } catch (err) {
-    return false;
-  }
-}
-
 async function sendPushToAllSubscriptions(payload, options = {}) {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
     console.warn('sendPushToAllSubscriptions: VAPID keys missing, skipping');
@@ -1458,8 +1447,21 @@ async function sendPushToAllSubscriptions(payload, options = {}) {
 
   let rows = result.rows;
 
-  // محادثة مخفية: الإيجنت متعرفش أصلاً إنها موجودة، فمش المفروض يتبعتله إشعار عنها
-  if (options.adminOnly) {
+  if (options.sessionId) {
+    const accessState = options.accessState ||
+      await getConversationAccessState(options.sessionId);
+    const before = rows.length;
+
+    rows = rows.filter((row) => {
+      const account = findDashboardAccountByUsername(row.created_by);
+      return canDashboardUserAccessConversation(account, accessState);
+    });
+
+    console.log(
+      `sendPushToAllSubscriptions: conversation access filter kept ${rows.length}/${before} subscription(s)`
+    );
+  // الحفاظ على المسار القديم لأي استدعاء آخر لا يمرر sessionId.
+  } else if (options.adminOnly) {
     const before = rows.length;
     rows = rows.filter((row) => row.created_by === DASHBOARD_USERNAME);
     console.log(
@@ -1530,13 +1532,7 @@ function buildPushBodyText(payload) {
 async function sendNewMessagePush(sessionId, payload) {
   console.log(`sendNewMessagePush: triggered for session ${sessionId}`);
 
-  const hidden = await isConversationHidden(sessionId);
-  const visibilityResult = await pool.query(
-    `SELECT username
-     FROM conversation_user_visibility
-     WHERE session_id = $1 AND is_hidden = true`,
-    [sessionId]
-  );
+  const accessState = await getConversationAccessState(sessionId);
   const customerName = (await getCustomerNameForSession(sessionId)) || 'عميل';
   const body = buildPushBodyText(payload);
 
@@ -1548,8 +1544,8 @@ async function sendNewMessagePush(sessionId, payload) {
       url: '/'
     },
     {
-      adminOnly: hidden,
-      hiddenUsernames: visibilityResult.rows.map((row) => row.username)
+      sessionId,
+      accessState
     }
   );
 }
