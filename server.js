@@ -249,6 +249,8 @@ const DASHBOARD_CONFIRMATION_USERNAME =
   process.env.DASHBOARD_CONFIRMATION_USERNAME || '';
 const DASHBOARD_CONFIRMATION_PASSWORD =
   process.env.DASHBOARD_CONFIRMATION_PASSWORD || '';
+const ORDER_CONFIRMATION_LINK_SECRET =
+  process.env.ORDER_CONFIRMATION_LINK_SECRET || '';
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || '';
 const META_APP_SECRET = process.env.META_APP_SECRET || '';
@@ -375,6 +377,87 @@ function requireConfirmationAccess(req, res, next) {
   }
 
   next();
+}
+
+function normalizeOrderConfirmationPhone(value) {
+  return String(value || '').trim().replace(/[\s()+-]/g, '');
+}
+
+function normalizeOrderConfirmationData(source = {}) {
+  return {
+    phone: normalizeOrderConfirmationPhone(source.phone),
+    name: String(source.name || '').trim(),
+    order: String(source.order || '').trim(),
+    items: String(source.items || '').trim(),
+    address: String(source.address || '').trim(),
+    contact: String(source.contact || '').trim(),
+    total: String(source.total || '').trim()
+  };
+}
+
+function getOrderConfirmationCanonicalPayload(source = {}) {
+  const data = normalizeOrderConfirmationData(source);
+  return JSON.stringify([
+    data.phone,
+    data.name,
+    data.order,
+    data.items,
+    data.address,
+    data.contact,
+    data.total
+  ]);
+}
+
+function getOrderConfirmationPayloadDigest(source = {}) {
+  return crypto
+    .createHash('sha256')
+    .update(getOrderConfirmationCanonicalPayload(source), 'utf8')
+    .digest('hex');
+}
+
+function verifyOrderConfirmationLinkSignature(source = {}) {
+  if (!ORDER_CONFIRMATION_LINK_SECRET) return false;
+
+  const received = String(source.sig || '').trim().toLowerCase();
+  const expected = crypto
+    .createHmac('sha256', ORDER_CONFIRMATION_LINK_SECRET)
+    .update(getOrderConfirmationCanonicalPayload(source), 'utf8')
+    .digest('hex');
+
+  return safeEqualText(received, expected);
+}
+
+function getTemporaryOrderConfirmationGrant(req) {
+  const token = String(
+    req.headers['x-order-confirmation-access'] ||
+    req.query.orderConfirmationAccess ||
+    ''
+  );
+  if (!token) return null;
+
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+}
+
+function hasTemporaryOrderConfirmationAccess(req, sessionId) {
+  if (req.user?.role !== 'confirmation') return false;
+  const grant = getTemporaryOrderConfirmationGrant(req);
+  return (
+    grant?.scope === 'order_confirmation_session' &&
+    grant?.username === req.user.username &&
+    grant?.sessionId === String(sessionId || '')
+  );
+}
+
+function canUseTemporaryOrderConfirmationAccess(req, sessionId, accessState) {
+  return (
+    hasTemporaryOrderConfirmationAccess(req, sessionId) &&
+    !accessState.globallyHidden &&
+    !accessState.hiddenForUsernames.has(req.user?.username)
+  );
 }
 
 function requireGallery(req, res, next) {
@@ -1100,7 +1183,10 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
 
   try {
     const accessState = await getConversationAccessState(sessionId);
-    if (!canDashboardUserAccessConversation(req.user, accessState)) {
+    if (
+      !canDashboardUserAccessConversation(req.user, accessState) &&
+      !canUseTemporaryOrderConfirmationAccess(req, sessionId, accessState)
+    ) {
       return res.status(403).json({
         error: 'Forbidden: conversation is not available for this user'
       });
@@ -1167,7 +1253,10 @@ app.get('/api/media/:sessionId', requireAuth, async (req, res) => {
 
   try {
     const accessState = await getConversationAccessState(sessionId);
-    if (!canDashboardUserAccessConversation(req.user, accessState)) {
+    if (
+      !canDashboardUserAccessConversation(req.user, accessState) &&
+      !canUseTemporaryOrderConfirmationAccess(req, sessionId, accessState)
+    ) {
       return res.status(403).json({
         error: 'Forbidden: conversation is not available for this user'
       });
@@ -2576,24 +2665,98 @@ function buildOrderConfirmationPreview(orderData) {
 }
 
 app.post(
+  '/api/order-confirmation/context',
+  requireAuth,
+  requireConfirmationAccess,
+  async (req, res) => {
+    try {
+      const phone = normalizeOrderConfirmationPhone(req.body?.phone);
+      const currentOrder = String(req.body?.order || '').trim();
+
+      if (!/^\d{8,15}$/.test(phone)) {
+        return res.status(400).json({
+          error: 'WhatsApp phone must be an international number containing 8 to 15 digits'
+        });
+      }
+
+      if (req.user?.role === 'confirmation') {
+        if (!ORDER_CONFIRMATION_LINK_SECRET) {
+          return res.status(503).json({
+            error: 'Order confirmation signed links are not configured'
+          });
+        }
+
+        if (!verifyOrderConfirmationLinkSignature(req.body)) {
+          return res.status(403).json({
+            error: 'Invalid or modified order confirmation link'
+          });
+        }
+      }
+
+      const result = await pool.query(
+        `SELECT id, created_at, message
+         FROM chat_memory
+         WHERE session_id = $1
+           AND message->>'message_kind' = 'template'
+           AND message->>'template_name' = 'order_confirmation'
+         ORDER BY id DESC`,
+        [phone]
+      );
+
+      const confirmations = result.rows.map((row) => {
+        const message = row.message || {};
+        const parameters = Array.isArray(message.template_parameters)
+          ? message.template_parameters
+          : Array.isArray(message.whatsapp_payload?.parameters)
+            ? message.whatsapp_payload.parameters
+            : [];
+
+        return {
+          messageId: row.id,
+          timestamp: message.timestamp || row.created_at,
+          order: String(parameters[1] || '').trim()
+        };
+      });
+      const sameOrderConfirmation = currentOrder
+        ? confirmations.find((item) => item.order === currentOrder) || null
+        : null;
+      const lastConfirmation = confirmations[0] || null;
+
+      const accessToken = jwt.sign(
+        {
+          scope: 'order_confirmation_session',
+          sessionId: phone,
+          username: req.user.username,
+          orderDigest: getOrderConfirmationPayloadDigest(req.body)
+        },
+        JWT_SECRET,
+        { expiresIn: '30m' }
+      );
+
+      res.json({
+        success: true,
+        sessionId: phone,
+        accessToken,
+        hasPreviousConfirmation: confirmations.length > 0,
+        lastConfirmation,
+        sameOrderConfirmation
+      });
+    } catch (err) {
+      console.error('order-confirmation/context error:', err);
+      res.status(500).json({ error: 'Failed to prepare order confirmation context' });
+    }
+  }
+);
+
+app.post(
   '/api/send-order-confirmation',
   requireAuth,
   requireConfirmationAccess,
   async (req, res) => {
     try {
       const source = req.body || {};
-      const phone = String(source.phone || '')
-        .trim()
-        .replace(/[\s()+-]/g, '');
-      const orderData = {
-        phone,
-        name: String(source.name || '').trim(),
-        order: String(source.order || '').trim(),
-        items: String(source.items || '').trim(),
-        address: String(source.address || '').trim(),
-        contact: String(source.contact || '').trim(),
-        total: String(source.total || '').trim()
-      };
+      const orderData = normalizeOrderConfirmationData(source);
+      const { phone } = orderData;
 
       const missingFields = Object.entries(orderData)
         .filter(([, value]) => !value)
@@ -2609,6 +2772,33 @@ app.post(
         return res.status(400).json({
           error: 'WhatsApp phone must be an international number containing 8 to 15 digits'
         });
+      }
+
+
+      if (req.user?.role === 'confirmation') {
+        const grant = getTemporaryOrderConfirmationGrant(req);
+        const validGrant = (
+          grant?.scope === 'order_confirmation_session' &&
+          grant?.username === req.user.username &&
+          grant?.sessionId === phone &&
+          grant?.orderDigest === getOrderConfirmationPayloadDigest(orderData)
+        );
+
+        if (!validGrant) {
+          return res.status(403).json({
+            error: 'A valid order confirmation context is required'
+          });
+        }
+
+        const accessState = await getConversationAccessState(phone);
+        if (
+          accessState.globallyHidden ||
+          accessState.hiddenForUsernames.has(req.user.username)
+        ) {
+          return res.status(403).json({
+            error: 'This conversation is hidden for the current user'
+          });
+        }
       }
 
       const fieldLimits = {
