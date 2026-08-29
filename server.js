@@ -1,7 +1,6 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const https = require('https');
 const { Readable } = require('stream');
 
 const express = require('express');
@@ -151,292 +150,6 @@ async function compressVideoForWhatsApp(filePath, originalFileName, targetBytes)
     filename: compressedFileName,
     size: stats.size
   };
-}
-
-async function probeMessengerVideo(filePath) {
-  const { stdout } = await execFileAsync('ffprobe', [
-    '-v', 'error',
-    '-show_entries', 'format=format_name:stream=codec_type,codec_name,pix_fmt',
-    '-of', 'json',
-    filePath
-  ]);
-  const probe = JSON.parse(stdout || '{}');
-  const streams = Array.isArray(probe.streams) ? probe.streams : [];
-  const videoStream = streams.find((stream) => stream.codec_type === 'video') || {};
-  const audioStreams = streams.filter((stream) => stream.codec_type === 'audio');
-  const formatNames = String(probe.format?.format_name || '')
-    .split(',')
-    .map((name) => name.trim().toLowerCase());
-
-  return {
-    containerMp4: formatNames.includes('mp4'),
-    videoCodec: String(videoStream.codec_name || '').toLowerCase(),
-    pixelFormat: String(videoStream.pix_fmt || '').toLowerCase(),
-    audioCodecs: audioStreams.map((stream) =>
-      String(stream.codec_name || '').toLowerCase()
-    ),
-    hasVideo: Boolean(videoStream.codec_name)
-  };
-}
-
-async function hasMp4FastStart(filePath) {
-  const handle = await fs.promises.open(filePath, 'r');
-
-  try {
-    const { size: fileSize } = await handle.stat();
-    const header = Buffer.alloc(16);
-    let position = 0;
-    let moovPosition = -1;
-    let mdatPosition = -1;
-
-    while (position + 8 <= fileSize) {
-      const { bytesRead } = await handle.read(header, 0, 16, position);
-      if (bytesRead < 8) break;
-
-      let atomSize = header.readUInt32BE(0);
-      const atomType = header.toString('ascii', 4, 8);
-
-      if (atomSize === 1) {
-        if (bytesRead < 16) break;
-        const largeSize = header.readBigUInt64BE(8);
-        if (largeSize > BigInt(Number.MAX_SAFE_INTEGER)) return false;
-        atomSize = Number(largeSize);
-      } else if (atomSize === 0) {
-        atomSize = fileSize - position;
-      }
-
-      if (atomSize < 8 || position + atomSize > fileSize) break;
-      if (atomType === 'moov' && moovPosition < 0) moovPosition = position;
-      if (atomType === 'mdat' && mdatPosition < 0) mdatPosition = position;
-      if (moovPosition >= 0 && mdatPosition >= 0) break;
-
-      position += atomSize;
-    }
-
-    return moovPosition >= 0 && (mdatPosition < 0 || moovPosition < mdatPosition);
-  } finally {
-    await handle.close();
-  }
-}
-
-function messengerVideoPublicUrl(fileUrl, fileName) {
-  try {
-    const publicUrl = new URL(fileUrl);
-    const lastSlash = publicUrl.pathname.lastIndexOf('/');
-    publicUrl.pathname =
-      `${publicUrl.pathname.slice(0, lastSlash + 1)}${encodeURIComponent(fileName)}`;
-    return publicUrl.toString();
-  } catch (error) {
-    return fileUrl;
-  }
-}
-
-async function normalizeMessengerVideo(filePath, fileUrl) {
-  const inputProbe = await probeMessengerVideo(filePath);
-  const inputFastStart = inputProbe.containerMp4
-    ? await hasMp4FastStart(filePath)
-    : false;
-  const codecsCompatible =
-    inputProbe.hasVideo &&
-    inputProbe.videoCodec === 'h264' &&
-    inputProbe.pixelFormat === 'yuv420p' &&
-    inputProbe.audioCodecs.every((codec) => codec === 'aac');
-
-  if (inputProbe.containerMp4 && codecsCompatible && inputFastStart) {
-    console.log('Messenger video already compatible', {
-      file: path.basename(filePath),
-      videoCodec: inputProbe.videoCodec,
-      audioCodecs: inputProbe.audioCodecs,
-      pixelFormat: inputProbe.pixelFormat,
-      fastStart: true
-    });
-    return { filePath, fileUrl, normalized: false, mode: 'original' };
-  }
-
-  const parsedName = path.parse(path.basename(filePath));
-  const mode = inputProbe.containerMp4 && codecsCompatible ? 'remux' : 'reencode';
-  const outputFileName = `${parsedName.name}-messenger.mp4`;
-  const outputPath = path.join(uploadsDir, outputFileName);
-
-  if (fs.existsSync(outputPath)) {
-    try {
-      const existingProbe = await probeMessengerVideo(outputPath);
-      const existingFastStart = await hasMp4FastStart(outputPath);
-      const existingCompatible =
-        existingProbe.containerMp4 &&
-        existingProbe.hasVideo &&
-        existingProbe.videoCodec === 'h264' &&
-        existingProbe.pixelFormat === 'yuv420p' &&
-        existingProbe.audioCodecs.every((codec) => codec === 'aac') &&
-        existingFastStart;
-
-      if (existingCompatible) {
-        return {
-          filePath: outputPath,
-          fileUrl: messengerVideoPublicUrl(fileUrl, outputFileName),
-          normalized: true,
-          mode: 'cached'
-        };
-      }
-    } catch (error) {
-      console.warn('Existing Messenger video normalization is invalid; rebuilding', {
-        file: outputFileName,
-        error: error.message
-      });
-    }
-  }
-
-  const ffmpegArgs = [
-    '-y',
-    '-i', filePath,
-    '-map', '0:v:0',
-    '-map', '0:a?'
-  ];
-
-  if (mode === 'remux') {
-    ffmpegArgs.push('-c', 'copy');
-  } else {
-    ffmpegArgs.push(
-      '-c:v', 'libx264',
-      '-pix_fmt', 'yuv420p',
-      '-preset', 'veryfast',
-      '-crf', '18',
-      '-c:a', 'aac',
-      '-b:a', '192k'
-    );
-  }
-
-  ffmpegArgs.push('-movflags', '+faststart', outputPath);
-  await execFileAsync('ffmpeg', ffmpegArgs);
-
-  const outputProbe = await probeMessengerVideo(outputPath);
-  const outputFastStart = await hasMp4FastStart(outputPath);
-  const outputCompatible =
-    outputProbe.containerMp4 &&
-    outputProbe.hasVideo &&
-    outputProbe.videoCodec === 'h264' &&
-    outputProbe.pixelFormat === 'yuv420p' &&
-    outputProbe.audioCodecs.every((codec) => codec === 'aac') &&
-    outputFastStart;
-
-  if (!outputCompatible || fs.statSync(outputPath).size <= 0) {
-    throw new Error('Invalid Messenger MP4 after normalization');
-  }
-
-  console.log('Messenger video normalized', {
-    input: path.basename(filePath),
-    output: outputFileName,
-    mode,
-    inputVideoCodec: inputProbe.videoCodec,
-    inputAudioCodecs: inputProbe.audioCodecs,
-    inputPixelFormat: inputProbe.pixelFormat,
-    inputFastStart,
-    outputFastStart
-  });
-
-  return {
-    filePath: outputPath,
-    fileUrl: messengerVideoPublicUrl(fileUrl, outputFileName),
-    normalized: true,
-    mode
-  };
-}
-
-async function uploadMessengerVideoBinary(filePath) {
-  const pageAccessToken = String(
-    process.env.META_PAGE_ACCESS_TOKEN || ''
-  ).trim();
-  const pageId = String(process.env.META_PAGE_ID || '').trim();
-  const graphApiVersion = String(
-    process.env.META_GRAPH_API_VERSION || 'v26.0'
-  ).trim();
-
-  if (!pageAccessToken || !pageId) {
-    throw new Error('Messenger binary upload credentials are not configured');
-  }
-
-  const stats = await fs.promises.stat(filePath);
-  if (!stats.isFile() || stats.size <= 0) {
-    throw new Error('Messenger video file is missing or empty');
-  }
-
-  const boundary = `----AlMehrabMessenger${crypto.randomBytes(16).toString('hex')}`;
-  const safeFileName = path.basename(filePath).replace(/["\r\n]/g, '_');
-  const messagePayload = JSON.stringify({
-    attachment: {
-      type: 'video',
-      payload: { is_reusable: true }
-    }
-  });
-  const messagePart = Buffer.from(
-    `--${boundary}\r\n` +
-    'Content-Disposition: form-data; name="message"\r\n' +
-    'Content-Type: application/json\r\n\r\n' +
-    `${messagePayload}\r\n`
-  );
-  const fileHeader = Buffer.from(
-    `--${boundary}\r\n` +
-    `Content-Disposition: form-data; name="filedata"; filename="${safeFileName}"\r\n` +
-    'Content-Type: video/mp4\r\n\r\n'
-  );
-  const closingBoundary = Buffer.from(`\r\n--${boundary}--\r\n`);
-  const contentLength =
-    messagePart.length + fileHeader.length + stats.size + closingBoundary.length;
-  const requestUrl = new URL(
-    `https://graph.facebook.com/${graphApiVersion}/${encodeURIComponent(pageId)}/message_attachments`
-  );
-
-  return new Promise((resolve, reject) => {
-    const request = https.request(
-      requestUrl,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${pageAccessToken}`,
-          'Content-Type': `multipart/form-data; boundary=${boundary}`,
-          'Content-Length': String(contentLength)
-        }
-      },
-      (response) => {
-        const chunks = [];
-
-        response.on('data', (chunk) => chunks.push(chunk));
-        response.on('end', () => {
-          const responseText = Buffer.concat(chunks).toString('utf8');
-          let responseData = {};
-
-          try {
-            responseData = JSON.parse(responseText || '{}');
-          } catch (error) {
-            responseData = { error: { message: responseText || 'Invalid Meta response' } };
-          }
-
-          if (
-            response.statusCode < 200 ||
-            response.statusCode >= 300 ||
-            !responseData.attachment_id
-          ) {
-            reject(new Error(
-              responseData.error?.message ||
-              `Meta attachment upload failed with status ${response.statusCode}`
-            ));
-            return;
-          }
-
-          resolve(String(responseData.attachment_id));
-        });
-      }
-    );
-
-    request.on('error', reject);
-    request.write(messagePart);
-    request.write(fileHeader);
-
-    const fileStream = fs.createReadStream(filePath);
-    fileStream.on('error', (error) => request.destroy(error));
-    fileStream.on('end', () => request.end(closingBoundary));
-    fileStream.pipe(request, { end: false });
-  });
 }
 
 // الملفات المرفوعة أسماؤها فريدة، لذلك يمكن تخزينها بأمان لمدة سنة.
@@ -3486,74 +3199,28 @@ async function sendDashboardMediaToChannel({
   caption = '',
   messageKind,
   fileUrl,
-  localFilePath = '',
   thumbnailUrl = '',
   agentName,
   source
 }) {
   const channel = getConversationChannel(sessionId);
   const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
-  let effectiveFileUrl = fileUrl;
-  let effectiveLocalFilePath = '';
-  let messengerAttachmentId = '';
 
   if (!sendWebhookUrl) {
     throw new Error(`${channel} send webhook is not configured`);
-  }
-
-  const resolvedLocalFilePath = localFilePath
-    ? path.resolve(localFilePath)
-    : '';
-  const relativeToUploads = resolvedLocalFilePath
-    ? path.relative(path.resolve(uploadsDir), resolvedLocalFilePath)
-    : '';
-  const isLocalUpload =
-    Boolean(resolvedLocalFilePath) &&
-    relativeToUploads !== '' &&
-    !relativeToUploads.startsWith('..') &&
-    !path.isAbsolute(relativeToUploads) &&
-    fs.existsSync(resolvedLocalFilePath);
-
-  if (
-    channel === 'messenger' &&
-    messageKind === 'video' &&
-    isLocalUpload
-  ) {
-    const normalizedVideo = await normalizeMessengerVideo(
-      resolvedLocalFilePath,
-      fileUrl
-    );
-    effectiveFileUrl = normalizedVideo.fileUrl;
-    effectiveLocalFilePath = normalizedVideo.filePath;
-
-    console.log('messenger video binary upload start');
-
-    try {
-      messengerAttachmentId = await uploadMessengerVideoBinary(
-        effectiveLocalFilePath
-      );
-      console.log(
-        `messenger video binary upload success attachment_id=${messengerAttachmentId}`
-      );
-    } catch (error) {
-      console.error('messenger video binary upload fallback to url', {
-        error: error.message
-      });
-      messengerAttachmentId = '';
-    }
   }
 
   if (channel === 'messenger') {
     console.log('ATTACH/SAVED messenger media send start', {
       source,
       mediaKind: messageKind,
-      fileUrl: effectiveFileUrl,
+      fileUrl,
       timestamp: new Date().toISOString()
     });
     console.log('ATTACH/SAVED messenger media before n8n', {
       source,
       mediaKind: messageKind,
-      fileUrl: effectiveFileUrl,
+      fileUrl,
       timestamp: new Date().toISOString()
     });
   }
@@ -3568,12 +3235,9 @@ async function sendDashboardMediaToChannel({
       sessionId,
       message: caption || '',
       messageKind,
-      mediaUrl: effectiveFileUrl,
+      mediaUrl: fileUrl,
       thumbnailUrl,
-      agentName,
-      ...(messengerAttachmentId
-        ? { attachmentId: messengerAttachmentId }
-        : {})
+      agentName
     })
   });
   const data = await response.json().catch(() => ({}));
@@ -3588,7 +3252,7 @@ async function sendDashboardMediaToChannel({
     console.log('ATTACH/SAVED messenger media after n8n', {
       source,
       mediaKind: messageKind,
-      fileUrl: effectiveFileUrl,
+      fileUrl,
       timestamp: new Date().toISOString()
     });
   }
@@ -3597,7 +3261,7 @@ async function sendDashboardMediaToChannel({
     sessionId,
     agentName,
     messageKind,
-    effectiveFileUrl,
+    fileUrl,
     null,
     caption ? null : mediaKindPlaceholderText(messageKind)
   );
@@ -3642,7 +3306,6 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
     caption,
     messageKind: item.media_kind,
     fileUrl,
-    localFilePath: useLocalPublicUrl ? item.file_path : '',
     thumbnailUrl: item.thumbnail_url || '',
     agentName,
     source: 'saved'
@@ -4452,7 +4115,6 @@ app.post(
         caption,
         messageKind: messengerKind,
         fileUrl,
-        localFilePath: finalFilePath,
         thumbnailUrl,
         agentName,
         source: 'attach'
