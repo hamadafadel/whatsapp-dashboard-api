@@ -1180,6 +1180,14 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
   const beforeId = req.query.beforeId
     ? Number(req.query.beforeId)
     : null;
+  const parsedBeforeTimestamp = req.query.beforeTimestamp
+    ? new Date(String(req.query.beforeTimestamp))
+    : null;
+  const beforeTimestamp =
+    parsedBeforeTimestamp && Number.isFinite(parsedBeforeTimestamp.getTime())
+      ? parsedBeforeTimestamp.toISOString()
+      : null;
+  const isMessengerSession = String(sessionId || '').startsWith('fb:');
 
   try {
     const accessState = await getConversationAccessState(sessionId);
@@ -1195,7 +1203,7 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
     const [result, countResult] = await Promise.all([
       pool.query(
       `
-      SELECT * FROM (
+      WITH ordered_messages AS (
         SELECT
           id,
           session_id,
@@ -1203,16 +1211,47 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
           message,
           message->>'type' AS type,
           message->>'content' AS content,
-          message->>'message_kind' AS message_kind
+          message->>'message_kind' AS message_kind,
+          CASE
+            WHEN session_id LIKE 'fb:%'
+              AND COALESCE(message->>'timestamp', '') ~ '^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}'
+            THEN (message->>'timestamp')::timestamptz
+            ELSE created_at
+          END AS sort_timestamp
         FROM chat_memory
         WHERE session_id = $1
-          AND ($2::bigint IS NULL OR id < $2)
-        ORDER BY id DESC
-        LIMIT $3
-      ) page
-      ORDER BY id ASC
+      ), page AS (
+        SELECT *
+        FROM ordered_messages
+        WHERE (
+          $5::boolean
+          AND (
+            (
+              $2::timestamptz IS NOT NULL
+              AND (
+                sort_timestamp < $2::timestamptz
+                OR (sort_timestamp = $2::timestamptz AND id < $3::bigint)
+              )
+            ) OR (
+              $2::timestamptz IS NULL
+              AND ($3::bigint IS NULL OR id < $3::bigint)
+            )
+          )
+        ) OR (
+          NOT $5::boolean
+          AND ($3::bigint IS NULL OR id < $3::bigint)
+        )
+        ORDER BY
+          CASE WHEN $5::boolean THEN sort_timestamp END DESC,
+          id DESC
+        LIMIT $4
+      )
+      SELECT * FROM page
+      ORDER BY
+        CASE WHEN $5::boolean THEN sort_timestamp END ASC,
+        id ASC
       `,
-      [sessionId, beforeId, limit + 1]
+      [sessionId, beforeTimestamp, beforeId, limit + 1, isMessengerSession]
       ),
       pool.query(
         `SELECT COUNT(*)::int AS total FROM chat_memory WHERE session_id = $1`,
@@ -1229,7 +1268,8 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
       messages: pageRows,
       total: countResult.rows[0]?.total || 0,
       hasMore,
-      nextBeforeId: pageRows[0]?.id || null
+      nextBeforeId: pageRows[0]?.id || null,
+      nextBeforeTimestamp: pageRows[0]?.sort_timestamp || null
     });
   } catch (err) {
     console.error('Messages error:', err);
