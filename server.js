@@ -2340,17 +2340,8 @@ else if (!message) {
           details: data
         });
       }
-
-      if (messageKind !== 'reaction') {
-        await stampLatestAgentMessage(
-          sessionId,
-          agentName,
-          messageKind || 'text',
-          message || '',
-          replyTo
-        );
-      }
-
+      // Messenger canonical upsert already stored the authoritative Dashboard fields.
+      // Do not run the legacy locator-based stamp after the canonical MID merge.
       return res.json({ success: true, channel: 'messenger', data });
     }
 
@@ -3296,15 +3287,18 @@ async function sendDashboardMediaToChannel({
       timestamp: new Date().toISOString()
     });
   }
-
-  await stampLatestAgentMessage(
-    sessionId,
-    agentName,
-    messageKind,
-    fileUrl,
-    null,
-    caption ? null : mediaKindPlaceholderText(messageKind)
-  );
+  // Messenger media is finalized by the MID-based canonical upsert in
+  // From Dashboard_FB. Keep the legacy stamp only for WhatsApp.
+  if (channel !== 'messenger') {
+    await stampLatestAgentMessage(
+      sessionId,
+      agentName,
+      messageKind,
+      fileUrl,
+      null,
+      caption ? null : mediaKindPlaceholderText(messageKind)
+    );
+  }
 
   return data;
 }
