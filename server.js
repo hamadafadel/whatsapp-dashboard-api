@@ -809,9 +809,7 @@ async function stampLatestAgentMessage(
     agentName
   };
 
-  for (const client of clients) {
-    client.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
+  broadcastDashboardEvent(payload);
 }
 
 // اختبار السيرفر
@@ -1043,6 +1041,119 @@ function canDashboardUserAccessConversation(user, accessState) {
   return true;
 }
 
+function requireConversationRole(req, res, next) {
+  if (!['admin', 'agent', 'confirmation'].includes(req.user?.role)) {
+    return res.status(403).json({ error: 'Conversation access only' });
+  }
+  next();
+}
+
+async function canRequestAccessConversation(req, sessionId, options = {}) {
+  if (typeof sessionId !== 'string' || !sessionId.trim()) return false;
+  const normalizedSessionId = sessionId.trim();
+  if (!['admin', 'agent', 'confirmation'].includes(req.user?.role)) return false;
+  if (req.user.role === 'admin') return true;
+  const accessState = await getConversationAccessState(normalizedSessionId);
+  if (canDashboardUserAccessConversation(req.user, accessState)) return true;
+  if (options.allowTemporary && canUseTemporaryOrderConfirmationAccess(req, normalizedSessionId, accessState)) {
+    return true;
+  }
+  // Only the signed-link context endpoint may use this option, after signature validation.
+  return Boolean(
+    options.signedOrderContext && req.user.role === 'confirmation' &&
+    !accessState.globallyHidden &&
+    !accessState.hiddenForUsernames.has(req.user.username)
+  );
+}
+
+async function authorizeConversationRequest(req, res, sessionId, options = {}) {
+  if (typeof sessionId !== 'string' || !sessionId.trim()) {
+    res.status(400).json({ error: 'sessionId is required' });
+    return false;
+  }
+  try {
+    if (await canRequestAccessConversation(req, sessionId, options)) return true;
+    res.status(403).json({ error: 'Forbidden: conversation is not available for this user' });
+  } catch (err) {
+    console.error('Conversation authorization failed:', err.code || 'lookup_failed');
+    res.status(503).json({ error: 'Unable to verify conversation access' });
+  }
+  return false;
+}
+
+function requireConversationAccess(options = {}) {
+  return async (req, res, next) => {
+    const sessionId = req.params?.sessionId ?? req.body?.sessionId;
+    if (await authorizeConversationRequest(req, res, sessionId, options)) next();
+  };
+}
+
+// Serialize broadcasts so asynchronous authorization cannot invert message order.
+let dashboardBroadcastQueue = Promise.resolve();
+function broadcastDashboardEvent(payload) {
+  const dispatch = async () => {
+    const suppliedIds = [payload?.sessionId, payload?.session_id];
+    if (suppliedIds.some((id) => id != null && typeof id !== 'string')) return;
+    const [camelId, snakeId] = suppliedIds.map((id) => (id || '').trim());
+    if (camelId && snakeId && camelId !== snakeId) return;
+    const sessionId = camelId || snakeId;
+    let event = payload;
+    if (!sessionId) {
+      // Session-free events contain invalidation metadata only, never message content.
+      const globalTypes = ['conversations_changed', 'label_changed', 'saved_replies_changed', 'test_event'];
+      if (globalTypes.includes(payload?.type)) event = { type: payload.type };
+      else if (payload?.type === 'unread_changed' && payload.all === true) {
+        event = { type: 'unread_changed', sessionId: null, all: true };
+      } else return;
+    }
+
+    const recipients = [];
+    for (const client of clients) {
+      if (client.res.destroyed || client.res.writableEnded ||
+          (client.expiresAt && Date.now() >= client.expiresAt)) {
+        clients.delete(client);
+        if (!client.res.writableEnded) client.res.end();
+        continue;
+      }
+      const account = findDashboardAccountByUsername(client.username);
+      if (account && ['admin', 'agent', 'confirmation'].includes(account.role)) {
+        recipients.push({ client, account });
+      }
+    }
+
+    let accessState = null;
+    if (sessionId && recipients.some(({ account }) => account.role !== 'admin')) {
+      // One fresh lookup per event, shared by recipients. Never cache visibility across events.
+      try {
+        accessState = await getConversationAccessState(sessionId);
+      } catch (err) {
+        // Admin needs no visibility lookup; all other recipients fail closed.
+        console.error('SSE authorization lookup failed:', err.code || 'lookup_failed');
+      }
+    }
+    for (const { client, account } of recipients) {
+      if (sessionId && account.role !== 'admin' &&
+          !canDashboardUserAccessConversation(account, accessState)) continue;
+      if (!clients.has(client) || client.res.destroyed || client.res.writableEnded) continue;
+      if (client.expiresAt && Date.now() >= client.expiresAt) {
+        clients.delete(client);
+        client.res.end();
+        continue;
+      }
+      try {
+        client.res.write(`data: ${JSON.stringify(event)}\n\n`);
+      } catch (err) {
+        clients.delete(client);
+      }
+    }
+  };
+  dashboardBroadcastQueue = dashboardBroadcastQueue.then(dispatch).catch((err) => {
+    // Unexpected dispatcher failures must not escape into request handlers.
+    console.error('SSE authorization failed:', err.code || 'broadcast_failed');
+  });
+  return dashboardBroadcastQueue;
+}
+
 app.get('/api/conversations/:sessionId/visibility', requireAuth, requireAdmin, async (req, res) => {
   try {
     const users = getConversationVisibilityUsers();
@@ -1171,7 +1282,7 @@ app.get('/api/conversations-search', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
+app.get('/api/messages/:sessionId', requireAuth, requireConversationAccess({ allowTemporary: true }), async (req, res) => {
   const { sessionId } = req.params;
   const limit = Math.min(
     Math.max(Number(req.query.limit || 100), 1),
@@ -1190,16 +1301,6 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
   const isMessengerSession = String(sessionId || '').startsWith('fb:');
 
   try {
-    const accessState = await getConversationAccessState(sessionId);
-    if (
-      !canDashboardUserAccessConversation(req.user, accessState) &&
-      !canUseTemporaryOrderConfirmationAccess(req, sessionId, accessState)
-    ) {
-      return res.status(403).json({
-        error: 'Forbidden: conversation is not available for this user'
-      });
-    }
-
     const [result, countResult] = await Promise.all([
       pool.query(
       `
@@ -1281,7 +1382,7 @@ app.get('/api/messages/:sessionId', requireAuth, async (req, res) => {
 });
 
 // صور وفيديوهات محادثة واحدة للمعرض
-app.get('/api/media/:sessionId', requireAuth, async (req, res) => {
+app.get('/api/media/:sessionId', requireAuth, requireConversationAccess({ allowTemporary: true }), async (req, res) => {
   const { sessionId } = req.params;
   const limit = Math.min(
     Math.max(Number(req.query.limit || 48), 1),
@@ -1292,16 +1393,6 @@ app.get('/api/media/:sessionId', requireAuth, async (req, res) => {
     : null;
 
   try {
-    const accessState = await getConversationAccessState(sessionId);
-    if (
-      !canDashboardUserAccessConversation(req.user, accessState) &&
-      !canUseTemporaryOrderConfirmationAccess(req, sessionId, accessState)
-    ) {
-      return res.status(403).json({
-        error: 'Forbidden: conversation is not available for this user'
-      });
-    }
-
     const [result, countResult] = await Promise.all([
       pool.query(
         `
@@ -1477,21 +1568,20 @@ app.post('/api/webhooks/messenger', (req, res) => {
 });
 
 // SSE test
-app.get('/api/test-event', (req, res) => {
+app.get('/api/test-event', requireAuth, requireConversationRole, (req, res) => {
   const payload = {
+    type: 'test_event',
     message: 'Hello from server 🔥',
     time: new Date().toISOString()
   };
 
-  for (const client of clients) {
-    client.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
+  broadcastDashboardEvent(payload);
 
   res.json({ sent: true });
 });
 
 // SSE stream
-app.get('/api/events', requireAuth, (req, res) => {
+app.get('/api/events', requireAuth, requireConversationRole, (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
@@ -1500,10 +1590,15 @@ app.get('/api/events', requireAuth, (req, res) => {
 
   res.write(`data: ${JSON.stringify({ connected: true })}\n\n`);
 
-  clients.add(res);
+  const client = {
+    res,
+    username: req.user.username,
+    expiresAt: req.user.exp ? Number(req.user.exp) * 1000 : null
+  };
+  clients.add(client);
 
   req.on('close', () => {
-    clients.delete(res);
+    clients.delete(client);
   });
 });
 
@@ -1520,9 +1615,7 @@ app.post('/api/push-update', (req, res) => {
     time: new Date().toISOString()
   };
 
-  for (const client of clients) {
-    client.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
+  broadcastDashboardEvent(payload);
 
   console.log(
     `push-update received: type=${payload.type} messageType=${payload.messageType} sessionId=${payload.sessionId}`
@@ -1813,9 +1906,7 @@ app.post(
         unreadCount: 0
       };
 
-      for (const client of clients) {
-        client.write(`data: ${JSON.stringify(payload)}\n\n`);
-      }
+      broadcastDashboardEvent(payload);
 
       res.json({ success: true, sessionId });
     } catch (err) {
@@ -1849,9 +1940,7 @@ app.post(
         all: true
       };
 
-      for (const client of clients) {
-        client.write(`data: ${JSON.stringify(payload)}\n\n`);
-      }
+      broadcastDashboardEvent(payload);
 
       res.json({ success: true });
     } catch (err) {
@@ -1867,9 +1956,7 @@ app.post(
 function broadcastConversationsChanged() {
   const payload = { type: 'conversations_changed' };
 
-  for (const client of clients) {
-    client.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
+  broadcastDashboardEvent(payload);
 }
 
 function parseSessionIds(body) {
@@ -1957,9 +2044,7 @@ app.post(
 
       for (const sessionId of sessionIds) {
         const payload = { type: 'unread_changed', sessionId, unreadCount: 0 };
-        for (const client of clients) {
-          client.write(`data: ${JSON.stringify(payload)}\n\n`);
-        }
+        broadcastDashboardEvent(payload);
       }
 
       res.json({ success: true, count: sessionIds.length });
@@ -1976,9 +2061,7 @@ app.post(
 function broadcastLabelChanged(sessionId) {
   const payload = { type: 'label_changed', sessionId: sessionId || null };
 
-  for (const client of clients) {
-    client.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
+  broadcastDashboardEvent(payload);
 }
 
 // كل الليبلز المتاحة (كل الأدوار تقدر تشوفها عشان تلزّق أي ليبل على أي محادثة)
@@ -2263,7 +2346,7 @@ app.delete(
 );
 
 // إرسال رسالة من الداشبورد
-app.post('/api/send-message', requireAuth, async (req, res) => {
+app.post('/api/send-message', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const agentName =
       req.user?.displayName ||
@@ -2414,7 +2497,7 @@ async function getLastCustomerMessageTime(sessionId) {
   return result.rows[0]?.created_at || null;
 }
 
-app.post('/api/dashboard-action', requireAuth, async (req, res) => {
+app.post('/api/dashboard-action', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const { sessionId, actionId } = req.body || {};
     const actionLabel = DASHBOARD_ACTIONS[actionId];
@@ -2495,7 +2578,7 @@ app.post('/api/dashboard-action', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/meta-purchase', requireAuth, async (req, res) => {
+app.post('/api/meta-purchase', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const {
       sessionId,
@@ -2611,7 +2694,7 @@ app.get('/api/templates', requireAuth, (req, res) => {
   res.json({ templates });
 });
 
-app.post('/api/send-template', requireAuth, async (req, res) => {
+app.post('/api/send-template', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const { sessionId, templateId } = req.body || {};
     const template = WHATSAPP_TEMPLATES[templateId];
@@ -2724,6 +2807,8 @@ app.post(
         }
       }
 
+      if (!await authorizeConversationRequest(req, res, phone, { signedOrderContext: true })) return;
+
       const result = await pool.query(
         `SELECT id, created_at, message
          FROM chat_memory
@@ -2821,15 +2906,7 @@ app.post(
           });
         }
 
-        const accessState = await getConversationAccessState(phone);
-        if (
-          accessState.globallyHidden ||
-          accessState.hiddenForUsernames.has(req.user.username)
-        ) {
-          return res.status(403).json({
-            error: 'This conversation is hidden for the current user'
-          });
-        }
+        if (!await authorizeConversationRequest(req, res, phone, { allowTemporary: true })) return;
       }
 
       const fieldLimits = {
@@ -2920,7 +2997,7 @@ app.post(
 );
 
 // جلب حالة AI
-app.get('/api/ai-status/:sessionId', requireAuth, async (req, res) => {
+app.get('/api/ai-status/:sessionId', requireAuth, requireConversationAccess(), async (req, res) => {
   const { sessionId } = req.params;
 
   try {
@@ -2954,7 +3031,7 @@ app.get('/api/ai-status/:sessionId', requireAuth, async (req, res) => {
 });
 
 // تغيير حالة AI
-app.post('/api/ai-status', requireAuth, async (req, res) => {
+app.post('/api/ai-status', requireAuth, requireConversationAccess(), async (req, res) => {
   const { sessionId, ai_enabled } = req.body;
 
   if (!sessionId || typeof ai_enabled !== 'boolean') {
@@ -2980,9 +3057,7 @@ app.post('/api/ai-status', requireAuth, async (req, res) => {
       ai_enabled
     };
 
-    for (const client of clients) {
-      client.write(`data: ${JSON.stringify(payload)}\n\n`);
-    }
+    broadcastDashboardEvent(payload);
 
     res.json({
       success: true,
@@ -3002,9 +3077,7 @@ app.post('/api/ai-status', requireAuth, async (req, res) => {
 function broadcastSavedRepliesChanged() {
   const payload = { type: 'saved_replies_changed' };
 
-  for (const client of clients) {
-    client.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
+  broadcastDashboardEvent(payload);
 }
 
 function mapSavedReplyRow(row, currentUser) {
@@ -3353,11 +3426,12 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
 const sendMediaJobs = new Map();
 let sendMediaJobCounter = 0;
 
-function startSendMediaJob(items, sessionId, agentName, caption = '') {
+function startSendMediaJob(items, sessionId, agentName, caption = '', user) {
   const jobId = `job_${Date.now()}_${++sendMediaJobCounter}`;
 
   const job = {
     id: jobId,
+    sessionId,
     total: items.length,
     sent: 0,
     failed: 0,
@@ -3377,6 +3451,9 @@ function startSendMediaJob(items, sessionId, agentName, caption = '') {
       if (job.cancelled) break;
 
       try {
+        if (!await canRequestAccessConversation({ user }, sessionId)) {
+          throw new Error('Forbidden: conversation is not available for this user');
+        }
         await sendSavedMediaToSession(item, sessionId, agentName, caption);
         job.sent++;
       } catch (err) {
@@ -3404,23 +3481,25 @@ function serializeSendMediaJob(job) {
   };
 }
 
-app.get('/api/saved-media-send-jobs/:jobId', requireAuth, (req, res) => {
+app.get('/api/saved-media-send-jobs/:jobId', requireAuth, async (req, res) => {
   const job = sendMediaJobs.get(req.params.jobId);
 
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
 
+  if (!await authorizeConversationRequest(req, res, job.sessionId)) return;
   res.json(serializeSendMediaJob(job));
 });
 
-app.post('/api/saved-media-send-jobs/:jobId/cancel', requireAuth, (req, res) => {
+app.post('/api/saved-media-send-jobs/:jobId/cancel', requireAuth, async (req, res) => {
   const job = sendMediaJobs.get(req.params.jobId);
 
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
 
+  if (!await authorizeConversationRequest(req, res, job.sessionId)) return;
   job.cancelled = true;
   res.json(serializeSendMediaJob(job));
 });
@@ -3765,7 +3844,7 @@ app.post('/api/saved-media-items/:id/reorder', requireAuth, requireAdmin, async 
 });
 
 // إرسال عنصر واحد للعميل (أدمن أو إيجنت)
-app.post('/api/saved-media-items/:id/send', requireAuth, async (req, res) => {
+app.post('/api/saved-media-items/:id/send', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { sessionId, caption = '' } = req.body || {};
@@ -3789,7 +3868,7 @@ app.post('/api/saved-media-items/:id/send', requireAuth, async (req, res) => {
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    const job = startSendMediaJob(result.rows, sessionId, agentName, caption);
+    const job = startSendMediaJob(result.rows, sessionId, agentName, caption, req.user);
 
     res.json({ success: true, jobId: job.id, total: job.total });
   } catch (err) {
@@ -3802,7 +3881,7 @@ app.post('/api/saved-media-items/:id/send', requireAuth, async (req, res) => {
 });
 
 // إرسال مجموعة عناصر محددة للعميل دفعة واحدة (أدمن أو إيجنت)
-app.post('/api/saved-media-items/send-batch', requireAuth, async (req, res) => {
+app.post('/api/saved-media-items/send-batch', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const { sessionId, itemIds } = req.body || {};
     const ids = Array.isArray(itemIds)
@@ -3830,7 +3909,7 @@ app.post('/api/saved-media-items/send-batch', requireAuth, async (req, res) => {
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    const job = startSendMediaJob(result.rows, sessionId, agentName, '');
+    const job = startSendMediaJob(result.rows, sessionId, agentName, '', req.user);
 
     res.json({ success: true, jobId: job.id, total: job.total });
   } catch (err) {
@@ -3843,7 +3922,7 @@ app.post('/api/saved-media-items/send-batch', requireAuth, async (req, res) => {
 });
 
 // إرسال كل محتوى الفولدر للعميل دفعة واحدة (أدمن أو إيجنت)
-app.post('/api/saved-media-folders/:id/send', requireAuth, async (req, res) => {
+app.post('/api/saved-media-folders/:id/send', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const folderId = Number(req.params.id);
     const { sessionId } = req.body || {};
@@ -3869,7 +3948,7 @@ app.post('/api/saved-media-folders/:id/send', requireAuth, async (req, res) => {
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    const job = startSendMediaJob(result.rows, sessionId, agentName, '');
+    const job = startSendMediaJob(result.rows, sessionId, agentName, '', req.user);
 
     res.json({ success: true, jobId: job.id, total: job.total });
   } catch (err) {
@@ -3920,7 +3999,9 @@ app.post('/api/upload-media', upload.single('file'), async (req, res) => {
 app.post(
   '/api/send-media',
   requireAuth,
+  requireConversationRole,
   upload.single('file'),
+  requireConversationAccess(),
   async (req, res) => {
   let originalFilePath = null;
   let finalFilePath = null;
