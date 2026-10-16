@@ -15,6 +15,129 @@ const { promisify } = require("util");
 
 const execFileAsync = promisify(execFile);
 const app = express();
+// Separate preparation-only OAuth routes; existing channel routes are unchanged.
+// BEGIN INSTAGRAM INLINE OAUTH
+function createInstagramOAuthHelpers() {
+  'use strict';
+const CALLBACK = '/auth/instagram/callback';
+const COMPLETE = CALLBACK + '/complete';
+const COOKIE = '__Host-ig-oauth';
+const TTL = 5 * 60 * 1000;
+function config(env) {
+  const redirect = new URL(env.INSTAGRAM_OAUTH_REDIRECT_URI);
+  const frontend = new URL(env.INSTAGRAM_OAUTH_FRONTEND_ORIGIN);
+  if (redirect.protocol !== 'https:' || redirect.pathname !== CALLBACK || redirect.search || redirect.hash || redirect.username || redirect.password ||
+      frontend.protocol !== 'https:' || frontend.origin !== env.INSTAGRAM_OAUTH_FRONTEND_ORIGIN ||
+      !/^\d+$/.test(env.META_APP_ID || '') || !/^\d+$/.test(env.INSTAGRAM_FACEBOOK_LOGIN_CONFIG_ID || '') || !/^v\d+\.\d+$/.test(env.INSTAGRAM_OAUTH_GRAPH_VERSION || '')) throw Error('OAuth configuration invalid');
+  return { redirect: redirect.href, origin: redirect.origin, frontend: frontend.origin, appId: env.META_APP_ID, configId: env.INSTAGRAM_FACEBOOK_LOGIN_CONFIG_ID, version: env.INSTAGRAM_OAUTH_GRAPH_VERSION };
+}
+function createStore(now = Date.now) {
+  const pending = new Map();
+  const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+  return {
+    issue(username) {
+      for (const [key, value] of pending) if (value.expires <= now()) pending.delete(key);
+      if (pending.size >= 1000) throw Error('OAuth temporarily unavailable');
+      const state = crypto.randomBytes(32).toString('base64url');
+      const binding = crypto.randomBytes(32).toString('base64url');
+      pending.set(state, { binding: digest(binding), username, expires: now() + TTL });
+      return { state, binding };
+    },
+    consume(state, binding) {
+      if (typeof state !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(state) || typeof binding !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(binding)) return false;
+      const entry = pending.get(state);
+      if (!entry || entry.expires <= now() || !crypto.timingSafeEqual(Buffer.from(entry.binding), Buffer.from(digest(binding)))) return false;
+      pending.delete(state);
+      return true;
+    }
+  };
+}
+function classify(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw Error('Invalid response');
+  const allowed = ['state', 'code', 'access_token', 'error', 'error_reason', 'error_description', 'expires_in'];
+  if (Object.keys(body).some(k => !allowed.includes(k)) || Object.values(body).some(v => typeof v !== 'string' || v.length > 16384)) throw Error('Invalid response');
+  const hasCode = !!body.code, hasToken = !!body.access_token, hasError = !!(body.error || body.error_reason);
+  if ([hasCode, hasToken, hasError].filter(Boolean).length !== 1) throw Error('Ambiguous response');
+  if (hasError) return { status: body.error === 'access_denied' || body.error_reason === 'user_denied' ? 'cancelled' : 'provider_error', connected: false };
+  // This preparation stage neither exchanges codes nor validates/stores tokens.
+  return { status: 'authorization_received', responseType: hasCode ? 'code' : 'token', connected: false };
+}
+function bridgeScript() {
+  return `(async()=>{
+ const output=document.getElementById('result');
+ let payload={};
+ try{
+  const query=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1));
+  history.replaceState(null,'',location.pathname);
+  const allowed=['state','code','access_token','error','error_reason','error_description','expires_in'];
+  for(const key of allowed){const a=query.getAll(key),b=fragment.getAll(key);if(a.length+b.length>1)throw Error();if(a.length||b.length)payload[key]=(a[0]??b[0]);}
+  const response=await fetch('${COMPLETE}',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),redirect:'error'});
+  const result=await response.json();
+  if(!response.ok)throw Error();
+  output.textContent=result.status==='cancelled'?'تم إلغاء التفويض.':result.status==='provider_error'?'تعذر إكمال التفويض لدى Meta.':'تم استلام نتيجة التفويض بأمان. لم يتم ربط الحساب أو حفظ توكن في هذه المرحلة.';
+ }catch{output.textContent='تعذر التحقق من نتيجة التفويض. ابدأ محاولة جديدة من حساب Admin.';}
+ finally{for(const key of Object.keys(payload))payload[key]='';payload={};}
+})();`;
+}
+function registerInstagramOAuth(app, { requireAuth, requireAdmin, env = process.env, store = createStore() }) {
+  const security = (req, res, next) => { res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Cross-Origin-Opener-Policy': 'same-origin' }); next(); };
+  const getConfig = res => { try { return config(env); } catch { res.status(503).json({ error: 'Instagram OAuth is not configured' }); return null; } };
+  const cookie = (res, value, maxAge) => res.cookie(COOKIE, value, { secure: true, httpOnly: true, sameSite: 'lax', path: '/', maxAge });
+  // Mounted before global CORS. Only these OAuth endpoints get scoped CORS.
+  app.options('/auth/instagram/start', security, (req, res) => {
+    const c = getConfig(res); if (!c) return;
+    if (![c.origin, c.frontend].includes(req.get('Origin'))) return res.sendStatus(403);
+    res.set({ 'Access-Control-Allow-Origin': req.get('Origin'), 'Access-Control-Allow-Credentials': 'true', 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', Vary: 'Origin' }); res.sendStatus(204);
+  });
+  app.post('/auth/instagram/start', security, (req, res, next) => {
+    const c = getConfig(res); if (!c) return;
+    if (![c.origin, c.frontend].includes(req.get('Origin'))) return res.sendStatus(403);
+    res.set({ 'Access-Control-Allow-Origin': req.get('Origin'), 'Access-Control-Allow-Credentials': 'true', Vary: 'Origin' });
+    if (!/^Bearer \S+$/.test(req.headers.authorization || '')) return res.sendStatus(401);
+    next();
+  }, requireAuth, requireAdmin, (req, res) => {
+    const c = getConfig(res); if (!c) return;
+    try {
+      const { state, binding } = store.issue(req.user.username);
+      const url = new URL('https://www.facebook.com/' + c.version + '/dialog/oauth');
+      url.search = new URLSearchParams({ client_id: c.appId, redirect_uri: c.redirect, config_id: c.configId, response_type: 'code', state }).toString();
+      cookie(res, binding, TTL); res.json({ authorizationUrl: url.href, expiresIn: TTL / 1000 });
+    } catch { res.status(429).json({ error: 'OAuth temporarily unavailable' }); }
+  });
+  app.get(CALLBACK, security, (req, res) => {
+    const c = getConfig(res); if (!c) return;
+    const nonce = crypto.randomBytes(18).toString('base64');
+    res.set('Content-Security-Policy', `default-src 'none'; script-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`);
+    res.type('html').send(`<!doctype html><html lang="ar" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>تفويض Instagram</title><p id="result">جاري التحقق من نتيجة التفويض…</p><script nonce="${nonce}">${bridgeScript()}</script></html>`);
+  });
+  app.post(COMPLETE, security, (req, res) => {
+    const c = getConfig(res); if (!c) return;
+    if (req.get('Origin') !== c.origin || !req.is('application/json')) return res.sendStatus(403);
+    let body = req.body;
+    try {
+      const result = classify(body);
+      const matches = String(req.headers.cookie || '').split(';').map(v => v.trim()).filter(v => v.startsWith(COOKIE + '='));
+      const binding = matches.length === 1 ? matches[0].slice(COOKIE.length + 1) : '';
+      if (!store.consume(body.state, binding)) return res.status(403).json({ error: 'Invalid or expired OAuth state' });
+      cookie(res, '', 0); res.json(result);
+    } catch { res.status(400).json({ error: 'Invalid OAuth response' }); }
+    finally { if (body && typeof body === 'object') for (const key of Object.keys(body)) body[key] = ''; req.body = {}; body = null; }
+  });
+}
+  return { registerInstagramOAuth, config, createStore, classify, bridgeScript };
+}
+// END INSTAGRAM INLINE OAUTH
+const { registerInstagramOAuth } = createInstagramOAuthHelpers();
+// JSON parsing for the callback completion is scoped here because OAuth routes
+// precede global CORS. No raw-body/signature behavior of existing webhooks changes.
+app.use('/auth/instagram/callback/complete', express.json({ limit: '24kb' }));
+app.use('/auth/instagram/callback/complete', (err, req, res, next) => {
+  // Never let JSON parser diagnostics reflect authorization material.
+  if (!err) return next();
+  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+  res.status(400).json({ error: 'Invalid OAuth response' });
+});
+registerInstagramOAuth(app, { requireAuth, requireAdmin });
 app.use(cors());
 app.use(express.json({
   verify(req, res, buffer) {
@@ -254,6 +377,13 @@ const ORDER_CONFIRMATION_LINK_SECRET =
 const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || '';
 const META_APP_SECRET = process.env.META_APP_SECRET || '';
+// Explicitly configure the secret of the Meta app subscribed to Instagram.
+// No implicit fallback to another channel's app secret.
+const INSTAGRAM_VERIFY_TOKEN = process.env.INSTAGRAM_VERIFY_TOKEN || '';
+const INSTAGRAM_APP_SECRET = process.env.INSTAGRAM_APP_SECRET || '';
+const INSTAGRAM_ACCOUNT_ID = process.env.INSTAGRAM_ACCOUNT_ID || '';
+// Enable only after the isolated SQL tests, migration and role grants are approved.
+const INSTAGRAM_INGRESS_ENABLED = process.env.INSTAGRAM_INGRESS_ENABLED === 'true';
 const N8N_MESSENGER_WEBHOOK_URL =
   process.env.N8N_MESSENGER_WEBHOOK_URL || '';
 const N8N_FB_SEND_WEBHOOK_URL =
@@ -494,13 +624,105 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
+// BEGIN INSTAGRAM INLINE CHANNEL
+function createInstagramChannelHelpers() {
+  'use strict';
+// Pure validation shared by Dashboard API and the outbound n8n Code node.
+// No HTTP, credentials, database access, or implicit channel fallback.
+function prepareInstagramSendRequest(input, config) {
+ const fail=(errorCode,httpStatus=400)=>{throw Object.assign(new Error(errorCode),{errorCode,httpStatus});};
+ if(input.channel!=='instagram')fail('INVALID_CHANNEL');
+ const account=String(config.accountId||'');
+ const match=/^ig:(\d+):(\d+)$/.exec(String(input.sessionId||''));
+ if(!match||!/^\d+$/.test(account)||match[1]!==account||match[2]===account)fail('INVALID_SESSION');
+ const id=String(input.requestId||'');
+ if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))fail('INVALID_REQUEST_ID');
+ const kind=input.messageKind||'text';
+ if(!['text','image','video','audio'].includes(kind))fail('UNSUPPORTED_KIND',422);
+ if(input.replyTo)fail('QUOTED_REPLY_DISABLED',422);
+ if(input.caption!==undefined&&(typeof input.caption!=='string'||input.caption.length>1000))fail('INVALID_CAPTION');
+ let message,mediaUrl='';
+ if(kind==='text'){
+  if(typeof input.message!=='string'||!input.message.trim()||input.message.length>1000)fail('INVALID_TEXT');
+  message={text:input.message};
+ }else{
+  const origin=config.mediaOrigin||'https://wadashboardapi.almehrab.org';
+  if(!/^https:\/\/[a-z0-9.-]+(?::[0-9]+)?$/i.test(origin))fail('INVALID_MEDIA_ORIGIN',503);
+  if(typeof input.mediaUrl!=='string'||!input.mediaUrl.startsWith(origin+'/uploads/')||
+     /[?#\\\s<>"']/.test(input.mediaUrl))fail('INVALID_MEDIA_URL');
+  let path;try{path=decodeURIComponent(input.mediaUrl.slice(origin.length));}catch{fail('INVALID_MEDIA_URL');}
+  if(/[\\?#%\x00-\x1f]/.test(path)||path.split('/').some(p=>p==='.'||p==='..'))fail('INVALID_MEDIA_URL');
+  mediaUrl=input.mediaUrl;message={attachment:{type:kind,payload:{url:mediaUrl}}};
+ }
+ const prepared={type:'agent',channel:'instagram',message_kind:kind,
+  content:kind==='text'?input.message:`[Instagram ${kind}]`,caption:kind==='text'?'':(input.caption||''),media_url:mediaUrl,
+  attachments:kind==='text'?[]:[{type:kind,payload:{url:mediaUrl}}],
+  agent_name:typeof input.agentName==='string'?input.agentName.slice(0,120):'',reply_to:null};
+ return {requestId:id,sessionId:input.sessionId,customerId:match[2],prepared,
+  sendPayload:{recipient:{id:match[2]},messaging_type:'RESPONSE',message}};
+}
+function instagramError(message,status=503){return Object.assign(new Error(message),{status});}
+function parseInstagramSession(value,account){const m=/^ig:(\d+):(\d+)$/.exec(String(value||''));if(!m||m[1]!==account||m[1]===m[2])throw instagramError('Invalid Instagram session',400);return {account:m[1],customer:m[2]};}
+function createInstagramService({pool,env=process.env,fetchImpl=globalThis.fetch,now=Date.now}){
+ const account=String(env.INSTAGRAM_ACCOUNT_ID||'');
+ const query=async(sql,args)=>{if(!pool)throw instagramError('Instagram database is not configured');try{return await pool.query(sql,args);}catch{throw instagramError('Instagram storage is unavailable');}};
+ function workflowUrl(value,path){let url;try{url=new URL(value);}catch{throw instagramError('Invalid Instagram workflow URL');}
+  if(url.origin!=='https://n8n.almehrab.org'||url.pathname!==path||url.search||url.hash||url.username||url.password)throw instagramError('Invalid Instagram workflow URL');return url.href;}
+ async function receive(envelope,eventCount){
+  if(!env.N8N_INSTAGRAM_WORKER_WEBHOOK_URL||!env.INTERNAL_API_TOKEN)throw instagramError('Instagram receive workflow is not configured');
+  const url=workflowUrl(env.N8N_INSTAGRAM_WORKER_WEBHOOK_URL,'/webhook/instagram-events');
+  let response,data;try{response=await fetchImpl(url,{method:'POST',headers:{'Content-Type':'application/json','x-api-key':env.INTERNAL_API_TOKEN},
+   body:JSON.stringify(envelope),redirect:'error',signal:AbortSignal.timeout(45000)});data=await response.json();}catch{throw instagramError('Instagram receive workflow did not confirm persistence');}
+  if(!response.ok||data?.received!==true||data.eventCount!==eventCount||!Number.isInteger(data.persistedCount)||!Number.isInteger(data.ignoredCount)||data.persistedCount<0||data.ignoredCount<0||data.persistedCount+data.ignoredCount!==eventCount)
+   throw instagramError('Instagram receive workflow did not confirm persistence');
+  return {received:true,eventCount};
+ }
+ async function send(input){
+  parseInstagramSession(input.sessionId,account);
+  if(env.INSTAGRAM_OUTBOUND_ENABLED!=='true'||!env.N8N_IG_SEND_WEBHOOK_URL||!env.INTERNAL_API_TOKEN)throw instagramError('Instagram send workflow is not configured');
+  const url=workflowUrl(env.N8N_IG_SEND_WEBHOOK_URL,'/webhook/dashboard-send-ig');
+  const requestId=input.requestId||crypto.randomUUID();
+  const body={channel:'instagram',sessionId:input.sessionId,requestId,message:input.message||'',messageKind:input.messageKind||'text',
+   mediaUrl:input.mediaUrl||'',caption:input.caption||'',agentName:input.agentName||'',replyTo:input.replyTo||null};
+  try{prepareInstagramSendRequest(body,{accountId:account,mediaOrigin:env.INSTAGRAM_MEDIA_ORIGIN});}
+  catch(error){throw instagramError(error.errorCode||'Invalid Instagram send request',error.httpStatus||400);}
+  const context=await query(`SELECT max((message->>'timestamp')::timestamptz) AS last_user_message_at
+   FROM public.chat_memory WHERE session_id=$1 AND message->>'channel'='instagram'
+   AND message->>'type'='user' AND message->>'message_kind' IS DISTINCT FROM 'reaction'
+   AND message->>'timestamp' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T';`,[body.sessionId]);
+  const last=new Date(context.rows[0]?.last_user_message_at||0).getTime();
+  if(!last||now()-last>24*60*60*1000||last>now()+60000)throw instagramError('Instagram reply window is closed',403);
+  let response,data;try{response=await fetchImpl(url,{method:'POST',headers:{'Content-Type':'application/json','x-api-key':env.INTERNAL_API_TOKEN},
+   body:JSON.stringify(body),redirect:'error',signal:AbortSignal.timeout(45000)});data=await response.json();}
+  catch{throw instagramError('Instagram workflow delivery is uncertain; check the conversation before resending',502);}
+  const messages={META_REJECTED:'Meta rejected the Instagram message',DELIVERY_UNKNOWN:'Instagram delivery is uncertain; check the conversation before resending',
+   CAPTION_FAILED:'Instagram attachment was sent but its caption failed; do not resend the attachment',SENT_NOT_FINALIZED:'Meta accepted the message but local saving failed; do not resend automatically',WINDOW_CLOSED:'Instagram reply window is closed',
+   SENDING_DISABLED:'Instagram send workflow is disabled',STORAGE_UNAVAILABLE:'Instagram storage is unavailable'};
+  if(!response.ok||data?.success!==true)throw instagramError(messages[data?.errorCode]||'Instagram send workflow failed; do not resend automatically',
+   data?.errorCode==='WINDOW_CLOSED'?403:['SENDING_DISABLED','STORAGE_UNAVAILABLE'].includes(data?.errorCode)?503:502);
+  if(typeof data.message_id!=='string'||!data.message_id||data.requestId!==requestId||!(/^[1-9][0-9]*$/).test(String(data.storage_id||'')))
+   throw instagramError('Instagram workflow returned an incomplete confirmation; do not resend automatically',502);
+  return {success:true,channel:'instagram',message_id:data.message_id,requestId,storage_id:data.storage_id};
+ }
+ return {send,receive,async ready(){if(!pool)return false;await query('SELECT 1 FROM public.chat_memory LIMIT 0',[]);return true;}};
+}
+  return { createInstagramService, parseInstagramSession, prepareInstagramSendRequest };
+}
+// END INSTAGRAM INLINE CHANNEL
+const { createInstagramService } = createInstagramChannelHelpers();
+// Instagram reuses the existing dashboard database and conversation tables.
+const instagramService = createInstagramService({ pool });
+
+
 function getConversationChannel(sessionId) {
+  if (String(sessionId || '').startsWith('ig:')) return 'instagram';
   return String(sessionId || '').startsWith('fb:')
     ? 'messenger'
     : 'whatsapp';
 }
 
 function getDashboardSendWebhookUrl(sessionId) {
+  if (getConversationChannel(sessionId) === 'instagram') return process.env.N8N_IG_SEND_WEBHOOK_URL || null;
   return getConversationChannel(sessionId) === 'messenger'
     ? N8N_FB_SEND_WEBHOOK_URL
     : process.env.N8N_SEND_WEBHOOK_URL;
@@ -926,6 +1148,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
       SELECT
         latest.session_id,
         CASE
+          WHEN latest.session_id LIKE 'ig:%' THEN 'instagram'
           WHEN latest.session_id LIKE 'fb:%' THEN 'messenger'
           ELSE COALESCE(NULLIF(latest.channel, ''), 'whatsapp')
         END AS channel,
@@ -1298,7 +1521,7 @@ app.get('/api/messages/:sessionId', requireAuth, requireConversationAccess({ all
     parsedBeforeTimestamp && Number.isFinite(parsedBeforeTimestamp.getTime())
       ? parsedBeforeTimestamp.toISOString()
       : null;
-  const isMessengerSession = String(sessionId || '').startsWith('fb:');
+  const isMessengerSession = /^(fb:|ig:)/.test(String(sessionId || ''));
 
   try {
     const [result, countResult] = await Promise.all([
@@ -1314,7 +1537,7 @@ app.get('/api/messages/:sessionId', requireAuth, requireConversationAccess({ all
           message->>'content' AS content,
           message->>'message_kind' AS message_kind,
           CASE
-            WHEN session_id LIKE 'fb:%'
+            WHEN (session_id LIKE 'fb:%' OR session_id LIKE 'ig:%')
               AND COALESCE(message->>'timestamp', '') ~ '^\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}'
             THEN (message->>'timestamp')::timestamptz
             ELSE created_at
@@ -1492,6 +1715,85 @@ app.get('/api/media/:sessionId', requireAuth, requireConversationAccess({ allowT
 // Health
 app.get('/health', (req, res) => {
   res.status(200).json({ ok: true });
+});
+
+app.get('/api/instagram/status', requireAuth, requireAdmin, async (req, res) => {
+  let workerReady = false;
+  try { workerReady = await instagramService.ready(); } catch { /* fail closed */ }
+  return res.json({
+    channel: 'instagram', accountId: INSTAGRAM_ACCOUNT_ID,
+    databaseConfigured: !!pool, ingressEnabled: INSTAGRAM_INGRESS_ENABLED,
+    databaseReachable: workerReady, receivingWorkflowConfigured: !!process.env.N8N_INSTAGRAM_WORKER_WEBHOOK_URL, sendingEnabled: process.env.INSTAGRAM_OUTBOUND_ENABLED === 'true',
+    outboundWebhookConfigured: !!process.env.N8N_IG_SEND_WEBHOOK_URL
+  });
+});
+
+// Instagram webhook: verify first; acknowledge only durable inbox acceptance.
+app.get('/api/webhooks/instagram', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (
+    INSTAGRAM_VERIFY_TOKEN && mode === 'subscribe' &&
+    typeof token === 'string' && typeof challenge === 'string' &&
+    challenge.length > 0 && challenge.length <= 2048 &&
+    safeEqualText(token, INSTAGRAM_VERIFY_TOKEN)
+  ) {
+    return res.status(200).type('text/plain').send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+app.post('/api/webhooks/instagram', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  if (!INSTAGRAM_APP_SECRET || !/^\d+$/.test(INSTAGRAM_ACCOUNT_ID)) {
+    res.setHeader('Retry-After', '60');
+    return res.status(503).json({ error: 'Instagram webhook is not configured' });
+  }
+  const signature = req.headers['x-hub-signature-256'];
+  if (typeof signature !== 'string' || !/^sha256=[a-fA-F0-9]{64}$/.test(signature) || !Buffer.isBuffer(req.rawBody)) {
+    return res.sendStatus(401);
+  }
+  const expected = crypto.createHmac('sha256', INSTAGRAM_APP_SECRET).update(req.rawBody).digest();
+  const received = Buffer.from(signature.slice(7), 'hex');
+  if (!crypto.timingSafeEqual(received, expected)) return res.sendStatus(401);
+
+  const body = req.body;
+  if (!body || body.object !== 'instagram') return res.sendStatus(400);
+  if (!Array.isArray(body.entry) || body.entry.length === 0 || body.entry.some(entry =>
+    !entry || typeof entry.id !== 'string' || !/^\d+$/.test(entry.id)
+  )) return res.sendStatus(400);
+  // Validate every entry, not just the first, to reject mixed-account batches.
+  if (body.entry.some(entry => entry.id !== INSTAGRAM_ACCOUNT_ID)) return res.sendStatus(403);
+
+  if (!INSTAGRAM_INGRESS_ENABLED) {
+    res.setHeader('Retry-After', '60');
+    return res.status(503).json({ error: 'Instagram ingress is not enabled yet' });
+  }
+  let eventCount = 0;
+  for (const entry of body.entry) {
+    if (!Object.hasOwn(entry, 'messaging') && !Object.hasOwn(entry, 'standby')) return res.sendStatus(400);
+    for (const source of ['messaging', 'standby']) {
+      if (!Object.hasOwn(entry, source)) continue;
+      const events = entry[source];
+      if (!Array.isArray(events) || events.some(event => !event || typeof event !== 'object' || Array.isArray(event))) return res.sendStatus(400);
+      eventCount += events.length;
+    }
+  }
+  if (!eventCount) return res.sendStatus(400);
+  if (eventCount > 500) return res.sendStatus(413);
+
+  // n8n saves messages in the existing chat tables before returning its ACK.
+  return (async () => {
+    try {
+      const accepted = await instagramService.receive(body, eventCount);
+      return res.status(200).json(accepted);
+    } catch {
+      res.setHeader('Retry-After', '60');
+      return res.status(503).json({ error: 'Instagram persistence was not confirmed' });
+    }
+  })();
 });
 
 // Meta Messenger Webhook verification.
@@ -2347,6 +2649,10 @@ app.delete(
 
 // إرسال رسالة من الداشبورد
 app.post('/api/send-message', requireAuth, requireConversationAccess(), async (req, res) => {
+  if (getConversationChannel(req.body?.sessionId) === 'instagram') {
+    try { return res.json(await instagramService.send({ ...req.body, agentName: req.user?.displayName || req.user?.username || 'Agent' })); }
+    catch (error) { return res.status(error.status || 503).json({ error: error.message }); }
+  }
   try {
     const agentName =
       req.user?.displayName ||
@@ -2498,6 +2804,7 @@ async function getLastCustomerMessageTime(sessionId) {
 }
 
 app.post('/api/dashboard-action', requireAuth, requireConversationAccess(), async (req, res) => {
+  if (getConversationChannel(req.body?.sessionId) === 'instagram') return res.status(422).json({ error: 'Dashboard Actions are not supported for Instagram' });
   try {
     const { sessionId, actionId } = req.body || {};
     const actionLabel = DASHBOARD_ACTIONS[actionId];
@@ -2579,6 +2886,7 @@ app.post('/api/dashboard-action', requireAuth, requireConversationAccess(), asyn
 });
 
 app.post('/api/meta-purchase', requireAuth, requireConversationAccess(), async (req, res) => {
+  if (getConversationChannel(req.body?.sessionId) === 'instagram') return res.status(422).json({ error: 'Meta Purchase is not enabled for Instagram' });
   try {
     const {
       sessionId,
@@ -2695,6 +3003,7 @@ app.get('/api/templates', requireAuth, (req, res) => {
 });
 
 app.post('/api/send-template', requireAuth, requireConversationAccess(), async (req, res) => {
+  if (getConversationChannel(req.body?.sessionId) === 'instagram') return res.status(422).json({ error: 'WhatsApp Templates cannot be sent to Instagram' });
   try {
     const { sessionId, templateId } = req.body || {};
     const template = WHATSAPP_TEMPLATES[templateId];
@@ -2998,6 +3307,7 @@ app.post(
 
 // جلب حالة AI
 app.get('/api/ai-status/:sessionId', requireAuth, requireConversationAccess(), async (req, res) => {
+  if (getConversationChannel(req.params.sessionId) === 'instagram') return res.json({ sessionId: req.params.sessionId, ai_enabled: false });
   const { sessionId } = req.params;
 
   try {
@@ -3032,6 +3342,7 @@ app.get('/api/ai-status/:sessionId', requireAuth, requireConversationAccess(), a
 
 // تغيير حالة AI
 app.post('/api/ai-status', requireAuth, requireConversationAccess(), async (req, res) => {
+  if (getConversationChannel(req.body?.sessionId) === 'instagram') return res.status(422).json({ error: 'AI is not enabled for Instagram', ai_enabled: false });
   const { sessionId, ai_enabled } = req.body;
 
   if (!sessionId || typeof ai_enabled !== 'boolean') {
@@ -3308,6 +3619,14 @@ async function sendDashboardMediaToChannel({
   source
 }) {
   const channel = getConversationChannel(sessionId);
+  if (channel === 'instagram') {
+    const result = await instagramService.send({ sessionId, messageKind, mediaUrl: fileUrl, agentName });
+    if (caption) {
+      try { await instagramService.send({ sessionId, message: caption, agentName }); }
+      catch { throw Object.assign(new Error('Instagram attachment was sent, but its separate caption failed. Do not resend the attachment.'), { status: 502 }); }
+    }
+    return result;
+  }
   const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
 
   if (!sendWebhookUrl) {
@@ -3397,8 +3716,8 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
   }
 
   const useLocalPublicUrl =
-    channel === 'messenger' &&
-    (item.media_kind === 'image' || item.media_kind === 'video') &&
+    ((channel === 'messenger' && (item.media_kind === 'image' || item.media_kind === 'video')) ||
+     (channel === 'instagram' && ['image', 'video', 'audio'].includes(item.media_kind))) &&
     item.file_path &&
     fs.existsSync(item.file_path);
   const dashboardBaseUrl = String(
@@ -4114,6 +4433,25 @@ app.post(
       }
     }
 
+
+    if (
+      messageKind === "audio" &&
+      getConversationChannel(sessionId) === "instagram" &&
+      String(req.body.isVoiceRecording || "").toLowerCase() === "true"
+    ) {
+      const parsedName = path.parse(req.file.filename);
+      finalFileName = `${parsedName.name}-instagram.mp3`;
+      finalFilePath = path.join(uploadsDir, finalFileName);
+      await execFileAsync("ffmpeg", ["-n", "-i", originalFilePath, "-map", "0:a:0",
+        "-vn", "-c:a", "libmp3lame", "-b:a", "96k", "-f", "mp3", finalFilePath]);
+      const { stdout } = await execFileAsync("ffprobe", ["-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name:format=duration", "-of", "json", finalFilePath]);
+      const probe = JSON.parse(stdout || "{}");
+      if (probe.streams?.[0]?.codec_name !== "mp3" || !(Number(probe.format?.duration) > 0) ||
+          !(fs.statSync(finalFilePath).size > 0)) throw new Error("Invalid Instagram voice recording");
+      // Preserve the uploaded original and any partial output; no deletion.
+    }
+
     // Messenger rejects some browser-recorded WebM variants. Convert only
     // dashboard microphone recordings for Messenger; WhatsApp stays untouched.
     if (
@@ -4206,6 +4544,11 @@ app.post(
       }
     }
 
+    if (getConversationChannel(sessionId) === 'instagram') {
+      try { const data = await sendDashboardMediaToChannel({ sessionId, caption, messageKind, fileUrl, thumbnailUrl, agentName, source: 'attach' });
+        return res.json({ success: true, channel: 'instagram', url: fileUrl, data }); }
+      catch (error) { return res.status(error.status || 503).json({ error: error.message }); }
+    }
     const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
     if (!sendWebhookUrl) {
       return res.status(503).json({
@@ -4272,6 +4615,7 @@ app.post(
 
     // حذف الملف المحوّل غير المكتمل إن وُجد
     if (
+      getConversationChannel(req.body?.sessionId) !== "instagram" &&
       finalFilePath &&
       finalFilePath !== originalFilePath &&
       fs.existsSync(finalFilePath)
