@@ -639,7 +639,16 @@ function prepareInstagramSendRequest(input, config) {
  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))fail('INVALID_REQUEST_ID');
  const kind=input.messageKind||'text';
  if(!['text','image','video','audio'].includes(kind))fail('UNSUPPORTED_KIND',422);
- if(input.replyTo)fail('QUOTED_REPLY_DISABLED',422);
+ let replyTo=null;
+ if(input.replyTo!=null){
+  const reply=input.replyTo;
+  if(typeof reply!=='object'||Array.isArray(reply))fail('INVALID_REPLY_TARGET');
+  const ids=[reply.external_message_id,reply.channel_message_id,reply.message_id,reply.wa_message_id].filter(v=>v!=null&&v!=='');
+  const mid=ids[0];
+  if(typeof mid!=='string'||!mid||mid.length>2000||/[\s\x00-\x1f]/.test(mid)||/^\d+$/.test(mid)||/^(ig-|ig:|fb:|wamid[.:])/.test(mid)||ids.some(v=>v!==mid))fail('INVALID_REPLY_TARGET');
+  if(reply.sessionId&&reply.sessionId!==input.sessionId)fail('REPLY_TARGET_FORBIDDEN',403);
+  replyTo={mid,external_message_id:mid,channel_message_id:mid,wa_message_id:mid};
+ }
  if(input.caption!==undefined&&(typeof input.caption!=='string'||input.caption.length>1000))fail('INVALID_CAPTION');
  let message,mediaUrl='';
  if(kind==='text'){
@@ -657,9 +666,9 @@ function prepareInstagramSendRequest(input, config) {
  const prepared={type:'agent',channel:'instagram',message_kind:kind,
   content:kind==='text'?input.message:`[Instagram ${kind}]`,caption:kind==='text'?'':(input.caption||''),media_url:mediaUrl,
   attachments:kind==='text'?[]:[{type:kind,payload:{url:mediaUrl}}],
-  agent_name:typeof input.agentName==='string'?input.agentName.slice(0,120):'',reply_to:null};
+  agent_name:typeof input.agentName==='string'?input.agentName.slice(0,120):'',reply_to:replyTo};
  return {requestId:id,sessionId:input.sessionId,customerId:match[2],prepared,
-  sendPayload:{recipient:{id:match[2]},messaging_type:'RESPONSE',message}};
+  sendPayload:{recipient:{id:match[2]},messaging_type:'RESPONSE',message,...(replyTo?{reply_to:{mid:replyTo.mid}}:{})}};
 }
 function instagramError(message,status=503){return Object.assign(new Error(message),{status});}
 function parseInstagramSession(value,account){const m=/^ig:(\d+):(\d+)$/.exec(String(value||''));if(!m||m[1]!==account||m[1]===m[2])throw instagramError('Invalid Instagram session',400);return {account:m[1],customer:m[2]};}
@@ -684,8 +693,19 @@ function createInstagramService({pool,env=process.env,fetchImpl=globalThis.fetch
   const requestId=input.requestId||crypto.randomUUID();
   const body={channel:'instagram',sessionId:input.sessionId,requestId,message:input.message||'',messageKind:input.messageKind||'text',
    mediaUrl:input.mediaUrl||'',caption:input.caption||'',agentName:input.agentName||'',replyTo:input.replyTo||null};
-  try{prepareInstagramSendRequest(body,{accountId:account,mediaOrigin:env.INSTAGRAM_MEDIA_ORIGIN});}
+  try{body.replyTo=prepareInstagramSendRequest(body,{accountId:account,mediaOrigin:env.INSTAGRAM_MEDIA_ORIGIN}).prepared.reply_to;}
   catch(error){throw instagramError(error.errorCode||'Invalid Instagram send request',error.httpStatus||400);}
+  if(body.replyTo){
+   const target=await query(`SELECT message FROM public.chat_memory WHERE session_id=$1
+    AND message->>'channel'='instagram' AND message->>'message_kind' IS DISTINCT FROM 'reaction'
+    AND COALESCE(message->>'is_deleted','false')<>'true'
+    AND (message->>'external_message_id'=$2 OR message->>'channel_message_id'=$2)
+    ORDER BY id LIMIT 1`,[body.sessionId,body.replyTo.mid]);
+   const original=target.rows[0]?.message;
+   if(!original)throw instagramError('Instagram reply target does not belong to this conversation',403);
+   body.replyTo={...body.replyTo,content:original.content||'',type:original.type||'unknown',
+    message_kind:original.message_kind||'text',media_url:original.media_url||''};
+  }
   const context=await query(`SELECT max((message->>'timestamp')::timestamptz) AS last_user_message_at
    FROM public.chat_memory WHERE session_id=$1 AND message->>'channel'='instagram'
    AND message->>'type'='user' AND message->>'message_kind' IS DISTINCT FROM 'reaction'
@@ -3616,11 +3636,15 @@ async function sendDashboardMediaToChannel({
   fileUrl,
   thumbnailUrl = '',
   agentName,
-  source
+  source,
+  replyTo = null
 }) {
   const channel = getConversationChannel(sessionId);
   if (channel === 'instagram') {
-    const result = await instagramService.send({ sessionId, messageKind, mediaUrl: fileUrl, agentName });
+    if (typeof replyTo === 'string') {
+      try { replyTo = JSON.parse(replyTo); } catch { throw Object.assign(new Error('Invalid Instagram reply target'), { status: 400 }); }
+    }
+    const result = await instagramService.send({ sessionId, messageKind, mediaUrl: fileUrl, agentName, replyTo });
     if (caption) {
       try { await instagramService.send({ sessionId, message: caption, agentName }); }
       catch { throw Object.assign(new Error('Instagram attachment was sent, but its separate caption failed. Do not resend the attachment.'), { status: 502 }); }
@@ -4545,7 +4569,7 @@ app.post(
     }
 
     if (getConversationChannel(sessionId) === 'instagram') {
-      try { const data = await sendDashboardMediaToChannel({ sessionId, caption, messageKind, fileUrl, thumbnailUrl, agentName, source: 'attach' });
+      try { const data = await sendDashboardMediaToChannel({ sessionId, caption, messageKind, fileUrl, thumbnailUrl, agentName, source: 'attach', replyTo: req.body.replyTo || null });
         return res.json({ success: true, channel: 'instagram', url: fileUrl, data }); }
       catch (error) { return res.status(error.status || 503).json({ error: error.message }); }
     }
