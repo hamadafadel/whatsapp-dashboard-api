@@ -638,6 +638,16 @@ function prepareInstagramSendRequest(input, config) {
  const id=String(input.requestId||'');
  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id))fail('INVALID_REQUEST_ID');
  const kind=input.messageKind||'text';
+ if(kind==='reaction'){
+  const mid=input.messageId;
+  if(typeof mid!=='string'||!mid||mid.length>2000||/[\s\x00-\x1f]/.test(mid)||/^\d+$/.test(mid)||/^(ig-|ig:|fb:|wamid[.:])/.test(mid))fail('INVALID_REACTION_TARGET');
+  if(input.replyTo)fail('INVALID_REACTION_TARGET');
+  if(typeof input.emoji!=='string'||input.emoji.length>64||/[\s\x00-\x1fA-Za-z]/.test(input.emoji))fail('INVALID_INSTAGRAM_REACTION',422);
+  const emoji=['❤','♥','♥️'].includes(input.emoji)?'❤️':input.emoji;
+  if(emoji!==''&&(!/\p{Extended_Pictographic}|\p{Regional_Indicator}|\p{Emoji_Presentation}/u.test(emoji)||[...new Intl.Segmenter('und',{granularity:'grapheme'}).segment(emoji)].length!==1))fail('INVALID_INSTAGRAM_REACTION',422);
+  return {requestId:id,sessionId:input.sessionId,customerId:match[2],reactionTarget:mid,reactionEmoji:emoji,prepared:{reply_to:null},
+   sendPayload:{recipient:{id:match[2]},sender_action:emoji?'react':'unreact',payload:{message_id:mid,...(emoji?{reaction:emoji}:{})}}};
+ }
  if(!['text','image','video','audio'].includes(kind))fail('UNSUPPORTED_KIND',422);
  let replyTo=null;
  if(input.replyTo!=null){
@@ -692,18 +702,20 @@ function createInstagramService({pool,env=process.env,fetchImpl=globalThis.fetch
   const url=workflowUrl(env.N8N_IG_SEND_WEBHOOK_URL,'/webhook/dashboard-send-ig');
   const requestId=input.requestId||crypto.randomUUID();
   const body={channel:'instagram',sessionId:input.sessionId,requestId,message:input.message||'',messageKind:input.messageKind||'text',
-   mediaUrl:input.mediaUrl||'',caption:input.caption||'',agentName:input.agentName||'',replyTo:input.replyTo||null};
-  try{body.replyTo=prepareInstagramSendRequest(body,{accountId:account,mediaOrigin:env.INSTAGRAM_MEDIA_ORIGIN}).prepared.reply_to;}
+   mediaUrl:input.mediaUrl||'',caption:input.caption||'',agentName:input.agentName||'',replyTo:input.replyTo||null,
+   ...(input.messageKind==='reaction'?{messageId:input.messageId,emoji:input.emoji}:{})};
+  try{const prepared=prepareInstagramSendRequest(body,{accountId:account,mediaOrigin:env.INSTAGRAM_MEDIA_ORIGIN});body.replyTo=prepared.prepared.reply_to;
+   if(body.messageKind==='reaction')body.emoji=prepared.reactionEmoji;}
   catch(error){throw instagramError(error.errorCode||'Invalid Instagram send request',error.httpStatus||400);}
-  if(body.replyTo){
+  if(body.replyTo||body.messageKind==='reaction'){
    const target=await query(`SELECT message FROM public.chat_memory WHERE session_id=$1
     AND message->>'channel'='instagram' AND message->>'message_kind' IS DISTINCT FROM 'reaction'
     AND COALESCE(message->>'is_deleted','false')<>'true'
     AND (message->>'external_message_id'=$2 OR message->>'channel_message_id'=$2)
-    ORDER BY id LIMIT 1`,[body.sessionId,body.replyTo.mid]);
+    ORDER BY id LIMIT 1`,[body.sessionId,body.messageKind==='reaction'?body.messageId:body.replyTo.mid]);
    const original=target.rows[0]?.message;
    if(!original)throw instagramError('Instagram reply target does not belong to this conversation',403);
-   body.replyTo={...body.replyTo,content:original.content||'',type:original.type||'unknown',
+   if(body.replyTo)body.replyTo={...body.replyTo,content:original.content||'',type:original.type||'unknown',
     message_kind:original.message_kind||'text',media_url:original.media_url||''};
   }
   const context=await query(`SELECT max((message->>'timestamp')::timestamptz) AS last_user_message_at
@@ -718,8 +730,14 @@ function createInstagramService({pool,env=process.env,fetchImpl=globalThis.fetch
   const messages={META_REJECTED:'Meta rejected the Instagram message',DELIVERY_UNKNOWN:'Instagram delivery is uncertain; check the conversation before resending',
    CAPTION_FAILED:'Instagram attachment was sent but its caption failed; do not resend the attachment',SENT_NOT_FINALIZED:'Meta accepted the message but local saving failed; do not resend automatically',WINDOW_CLOSED:'Instagram reply window is closed',
    SENDING_DISABLED:'Instagram send workflow is disabled',STORAGE_UNAVAILABLE:'Instagram storage is unavailable'};
+  if(body.messageKind==='reaction'&&data?.errorCode==='META_REJECTED')throw instagramError('Meta rejected the selected Instagram reaction; no local reaction update was confirmed',422);
   if(!response.ok||data?.success!==true)throw instagramError(messages[data?.errorCode]||'Instagram send workflow failed; do not resend automatically',
    data?.errorCode==='WINDOW_CLOSED'?403:['SENDING_DISABLED','STORAGE_UNAVAILABLE'].includes(data?.errorCode)?503:502);
+  if(body.messageKind==='reaction'){
+   if(data.messageKind!=='reaction'||data.message_id!==body.messageId||data.requestId!==requestId||
+      data.emoji!==body.emoji||!(/^[1-9][0-9]*$/).test(String(data.storage_id||'')))throw instagramError('Instagram reaction persistence was not confirmed; do not retry automatically',502);
+   return {success:true,channel:'instagram',messageKind:'reaction',message_id:data.message_id,emoji:body.emoji,displayEmoji:typeof data.displayEmoji==='string'?data.displayEmoji:body.emoji,requestId,storage_id:data.storage_id};
+  }
   if(typeof data.message_id!=='string'||!data.message_id||data.requestId!==requestId||!(/^[1-9][0-9]*$/).test(String(data.storage_id||'')))
    throw instagramError('Instagram workflow returned an incomplete confirmation; do not resend automatically',502);
   return {success:true,channel:'instagram',message_id:data.message_id,requestId,storage_id:data.storage_id};

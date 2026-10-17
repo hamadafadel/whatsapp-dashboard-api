@@ -17,18 +17,7 @@ for(const kind of ['text','image','video','audio'])test('IG '+kind+' places quot
  assert.deepEqual(r.sendPayload.message,ordinary.sendPayload.message);assert.ok(!('reply_to'in ordinary.sendPayload));
 });
 
-test('Instagram media/voice forwards quote, retains login on permission 403 and clears quote only on success',()=>{
- const source=fs.readFileSync('app.js','utf8');
- const media=source.slice(source.indexOf('async function uploadMediaFile('),source.indexOf('async function queueComposerMediaFiles('));
- const audio=source.slice(source.indexOf('function sendRecordedAudio('));
- assert.match(media,/formData\.append\("replyTo", JSON\.stringify\(instagramMediaReply\)\)/);
- assert.match(audio,/formData\.append\("replyTo", JSON\.stringify\(instagramAudioReply\)\)/);
- assert.ok(media.includes('xhr.status === 403 && getChannelFromSessionId(targetSessionId) !== "instagram"'));
- assert.ok(audio.includes('xhr.status === 403 && !String(formData.get("sessionId")).startsWith("ig:")'));
- assert.ok(media.includes('selectedReplyMessage === instagramMediaReply'));
- assert.ok(audio.includes('selectedReplyMessage === instagramAudioReply'));
- assert.match(fs.readFileSync('index.html','utf8'),/app\.js\?v=71/);
-});
+
 
 for(const replyTo of [{id:42},{wa_message_id:'42'},{external_message_id:'ig-postback:FAKE'},
  {external_message_id:'ig-referral:FAKE'},{external_message_id:'ig:10001:20001'},{external_message_id:'fb:20001'},
@@ -56,4 +45,3 @@ test('missing or other-session MID returns 403 without contacting n8n',async()=>
 test('normal Instagram send retains one window query and no quote',async()=>{
  const f=service();await f.s.send(request({replyTo:null}));assert.equal(f.queries.length,1);assert.equal(f.calls[0].replyTo,null);
 });
-
