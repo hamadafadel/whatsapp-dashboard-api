@@ -1616,7 +1616,19 @@ app.get('/api/messages/:sessionId', requireAuth, requireConversationAccess({ all
       [sessionId, beforeTimestamp, beforeId, limit + 1, isMessengerSession]
       ),
       pool.query(
-        `SELECT COUNT(*)::int AS total FROM chat_memory WHERE session_id = $1`,
+        `SELECT COALESCE(SUM(
+          CASE WHEN session_id LIKE 'fb:%'
+            AND message->>'channel' = 'messenger'
+            AND jsonb_typeof(message->'attachments') = 'array'
+          THEN CASE WHEN NOT EXISTS (
+            SELECT 1 FROM jsonb_array_elements(message->'attachments') a
+            WHERE COALESCE(a->>'type', split_part(a->>'mime_type', '/', 1), '') <> 'image'
+          ) THEN GREATEST(1, (
+            SELECT COUNT(DISTINCT COALESCE(a#>>'{payload,url}', a#>>'{image_data,url}', a->>'url'))
+            FROM jsonb_array_elements(message->'attachments') a
+            WHERE COALESCE(a#>>'{payload,url}', a#>>'{image_data,url}', a->>'url', '') ~ '^https?://[^/@]+(/|$)'
+          )) ELSE 1 END ELSE 1 END
+        ), 0)::int AS total FROM chat_memory WHERE session_id = $1`,
         [sessionId]
       )
     ]);
