@@ -1867,7 +1867,40 @@ app.get('/api/webhooks/messenger', (req, res) => {
 // Verify authenticity first, acknowledge Meta quickly, then let the dedicated
 // n8n workflow normalize, deduplicate and process individual messaging events.
 app.post('/api/webhooks/messenger', (req, res) => {
-  if (!verifyMessengerSignature(req)) {
+  const signatureVerified = verifyMessengerSignature(req);
+  // TEMPORARY diagnostics: these counters describe untrusted input shape only.
+  // Never log payload values, headers, identities, text or attachment content.
+  const ingressEntries = Array.isArray(req.body?.entry) ? req.body.entry : [];
+  const ingress = {
+    object: req.body?.object === 'page' ? 'page' : 'other',
+    entry: ingressEntries.length,
+    messaging: 0,
+    standby: 0,
+    changes: 0,
+    message: 0,
+    is_echo: 0,
+    read: 0,
+    signatureVerified
+  };
+  for (const entry of ingressEntries) {
+    const messaging = Array.isArray(entry?.messaging) ? entry.messaging : [];
+    const standby = Array.isArray(entry?.standby) ? entry.standby : [];
+    ingress.messaging += messaging.length;
+    ingress.standby += standby.length;
+    ingress.changes += Array.isArray(entry?.changes) ? entry.changes.length : 0;
+    // Event counters apply to messaging/standby, not arbitrary changes values.
+    for (const events of [messaging, standby]) {
+      for (const event of events) {
+        if (event?.message && typeof event.message === 'object' && !Array.isArray(event.message)) {
+          ingress.message += 1;
+          if (event.message.is_echo === true) ingress.is_echo += 1;
+        }
+        if (event?.read && typeof event.read === 'object' && !Array.isArray(event.read)) ingress.read += 1;
+      }
+    }
+  }
+  console.log('[MESSENGER] Webhook ingress: untrusted payload shape only', ingress);
+  if (!signatureVerified) {
     console.warn('[MESSENGER] Rejected webhook with invalid signature');
     return res.sendStatus(401);
   }
