@@ -2098,7 +2098,8 @@ app.post('/api/push-update', (req, res) => {
   if (
     payload.type === 'new_message' &&
     payload.sessionId &&
-    payload.messageType === 'user'
+    payload.messageType === 'user' &&
+    payload.source !== 'history_sync'
   ) {
     sendNewMessagePush(payload.sessionId, payload).catch((err) => {
       console.error('push notification error:', err);
@@ -2224,6 +2225,8 @@ function buildPushBodyText(payload) {
 }
 
 async function sendNewMessagePush(sessionId, payload) {
+  if (payload?.source === 'history_sync') return;
+
   console.log(`sendNewMessagePush: triggered for session ${sessionId}`);
 
   const accessState = await getConversationAccessState(sessionId);
