@@ -15,6 +15,59 @@ const { promisify } = require("util");
 
 const execFileAsync = promisify(execFile);
 const app = express();
+// Temporary, opt-in Messenger-only diagnostics. Never inspect or log identities,
+// headers, URLs, payload content, signatures, or raw error messages.
+const MESSENGER_WEBHOOK_DIAGNOSTICS = process.env.MESSENGER_WEBHOOK_DIAGNOSTICS === 'true';
+const messengerDiagnosticContext = Symbol('messengerWebhookDiagnostics');
+function logMessengerWebhookDiagnostic(req, stage, fields = {}) {
+  const context = req[messengerDiagnosticContext];
+  if (!context) return;
+  try {
+    const record = { traceId: context.traceId, stage, elapsedMs: Math.max(0, Date.now() - context.startedAt) };
+    for (const key of ['entry', 'messaging', 'standby', 'changes', 'message', 'is_echo', 'read', 'eventIndex', 'eventCount']) {
+      if (Number.isSafeInteger(fields[key]) && fields[key] >= 0) record[key] = fields[key];
+    }
+    if (Number.isInteger(fields.httpStatus) && fields.httpStatus >= 100 && fields.httpStatus <= 599) record.httpStatus = fields.httpStatus;
+    for (const key of ['signatureVerified', 'hasEcho', 'isEcho']) {
+      if (typeof fields[key] === 'boolean') record[key] = fields[key];
+    }
+    if (fields.object === 'page' || fields.object === 'other') record.object = fields.object;
+    if (['success', 'failed', 'skipped', 'finished', 'closed', 'accepted', 'rejected', 'no_events', 'not_configured'].includes(fields.outcome)) record.outcome = fields.outcome;
+    if (['invalid_json', 'too_large', 'aborted', 'unsupported_encoding', 'other', 'network_error'].includes(fields.errorKind)) record.errorKind = fields.errorKind;
+    if (fields.payloadTrust === 'verified' || fields.payloadTrust === 'unverified') record.payloadTrust = fields.payloadTrust;
+    console.log('[MESSENGER_DIAGNOSTIC]', JSON.stringify(record));
+  } catch (_) {
+    // Diagnostics must never change request handling, including if logging fails.
+  }
+}
+function logMessengerJsonParsing(req, err) {
+  const kinds = {
+    'entity.parse.failed': 'invalid_json',
+    'entity.too.large': 'too_large',
+    'request.aborted': 'aborted',
+    'encoding.unsupported': 'unsupported_encoding',
+    'charset.unsupported': 'unsupported_encoding'
+  };
+  logMessengerWebhookDiagnostic(req, 'parsing', {
+    outcome: err ? 'failed' : Buffer.isBuffer(req.rawBody) ? 'success' : 'skipped',
+    ...(err ? { errorKind: kinds[err.type] || 'other', httpStatus: err.status || err.statusCode } : {})
+  });
+}
+app.use((req, res, next) => {
+  if (MESSENGER_WEBHOOK_DIAGNOSTICS && req.method === 'POST' && /^\/api\/webhooks\/messenger\/?$/i.test(req.path)) {
+    try {
+      req[messengerDiagnosticContext] = { traceId: crypto.randomUUID(), startedAt: Date.now() };
+      logMessengerWebhookDiagnostic(req, 'received');
+      res.once('finish', () => logMessengerWebhookDiagnostic(req, 'response', { outcome: 'finished', httpStatus: res.statusCode }));
+      res.once('close', () => {
+        if (!res.writableFinished) logMessengerWebhookDiagnostic(req, 'response', { outcome: 'closed', httpStatus: res.statusCode });
+      });
+    } catch (_) {
+      // Failure to initialize diagnostics must not block the request.
+    }
+  }
+  next();
+});
 // Separate preparation-only OAuth routes; existing channel routes are unchanged.
 // BEGIN INSTAGRAM INLINE OAUTH
 function createInstagramOAuthHelpers() {
@@ -139,11 +192,26 @@ app.use('/auth/instagram/callback/complete', (err, req, res, next) => {
 });
 registerInstagramOAuth(app, { requireAuth, requireAdmin });
 app.use(cors());
-app.use(express.json({
+const parseDashboardJson = express.json({
   verify(req, res, buffer) {
     req.rawBody = Buffer.from(buffer);
   }
-}));
+});
+app.use((req, res, next) => {
+  if (!req[messengerDiagnosticContext]) return parseDashboardJson(req, res, next);
+  let continued = false;
+  const parsed = (err) => {
+    continued = true;
+    logMessengerJsonParsing(req, err);
+    next(err);
+  };
+  try {
+    return parseDashboardJson(req, res, parsed);
+  } catch (err) {
+    if (continued) throw err;
+    return parsed(err);
+  }
+});
 // منع تخزين ملفات واجهة الداشبورد القديمة
 app.use((req, res, next) => {
   const noCacheFiles = [
@@ -1867,6 +1935,7 @@ app.get('/api/webhooks/messenger', (req, res) => {
 // Verify authenticity first, acknowledge Meta quickly, then let the dedicated
 // n8n workflow normalize, deduplicate and process individual messaging events.
 app.post('/api/webhooks/messenger', (req, res) => {
+  logMessengerWebhookDiagnostic(req, 'route');
   const signatureVerified = verifyMessengerSignature(req);
   // TEMPORARY diagnostics: these counters describe untrusted input shape only.
   // Never log payload values, headers, identities, text or attachment content.
@@ -1899,9 +1968,13 @@ app.post('/api/webhooks/messenger', (req, res) => {
       }
     }
   }
-  console.log('[MESSENGER] Webhook ingress: untrusted payload shape only', ingress);
+  logMessengerWebhookDiagnostic(req, 'signature', {
+    ...ingress,
+    hasEcho: ingress.is_echo > 0,
+    payloadTrust: signatureVerified ? 'verified' : 'unverified'
+  });
   if (!signatureVerified) {
-    console.warn('[MESSENGER] Rejected webhook with invalid signature');
+    if (!req[messengerDiagnosticContext]) console.warn('[MESSENGER] Rejected webhook with invalid signature');
     return res.sendStatus(401);
   }
 
@@ -1911,7 +1984,8 @@ app.post('/api/webhooks/messenger', (req, res) => {
   res.sendStatus(200);
 
   if (!N8N_MESSENGER_WEBHOOK_URL) {
-    console.error('[MESSENGER] N8N_MESSENGER_WEBHOOK_URL is missing');
+    logMessengerWebhookDiagnostic(req, 'forward_result', { outcome: 'not_configured' });
+    if (!req[messengerDiagnosticContext]) console.error('[MESSENGER] N8N_MESSENGER_WEBHOOK_URL is missing');
     return;
   }
 
@@ -1933,12 +2007,13 @@ app.post('/api/webhooks/messenger', (req, res) => {
       }))
     ]);
 
+  if (events.length === 0) logMessengerWebhookDiagnostic(req, 'forward_result', { outcome: 'no_events', eventCount: 0 });
+  // Retain only the generated trace context while forwarding, not the request.
+  const forwardDiagnosticRequest = { [messengerDiagnosticContext]: req[messengerDiagnosticContext] };
+  let eventIndex = 0;
   for (const item of events) {
-    const psid = String(item.event?.sender?.id || '');
-    console.log(
-      `[MESSENGER] Incoming event session=${psid ? `fb:${psid}` : 'unknown'}`
-    );
-
+    const diagnosticEventIndex = eventIndex++;
+    const diagnosticIsEcho = item.event?.message?.is_echo === true;
     fetch(N8N_MESSENGER_WEBHOOK_URL, {
       method: 'POST',
       headers: {
@@ -1946,8 +2021,20 @@ app.post('/api/webhooks/messenger', (req, res) => {
         'x-api-key': process.env.INTERNAL_API_TOKEN || ''
       },
       body: JSON.stringify(item)
-    }).catch((err) => {
-      console.error('[MESSENGER] n8n forward failed:', err.message);
+    }).then((response) => {
+      logMessengerWebhookDiagnostic(forwardDiagnosticRequest, 'forward_result', {
+        outcome: response.ok ? 'accepted' : 'rejected',
+        httpStatus: response.status,
+        eventIndex: diagnosticEventIndex,
+        isEcho: diagnosticIsEcho
+      });
+    }).catch(() => {
+      logMessengerWebhookDiagnostic(forwardDiagnosticRequest, 'forward_result', {
+        outcome: 'failed', errorKind: 'network_error',
+        eventIndex: diagnosticEventIndex,
+        isEcho: diagnosticIsEcho
+      });
+      if (!forwardDiagnosticRequest[messengerDiagnosticContext]) console.error('[MESSENGER] n8n forward failed');
     });
   }
 });
