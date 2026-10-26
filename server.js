@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const {PgSendQueueStore, SendQueue, fault: sendQueueFault} = require('./send-queue');
 const { Readable } = require('stream');
 
 const express = require('express');
@@ -192,6 +193,16 @@ app.use('/auth/instagram/callback/complete', (err, req, res, next) => {
 });
 registerInstagramOAuth(app, { requireAuth, requireAdmin });
 app.use(cors());
+// Versioned admission namespace: old Backends return 404 instead of accidentally
+// executing a retried request via a legacy, non-idempotent send handler.
+app.use((req,res,next)=>{
+  if(req.path.startsWith('/api/queued/')){
+    if(!/^\/api\/queued\/(send-message|send-media|saved-media-items\/(send-batch|[0-9]+\/send)|saved-media-folders\/[0-9]+\/send)$/.test(req.path))
+      return res.status(404).json({error:'UNKNOWN_QUEUE_OPERATION'});
+    req.url=req.url.replace('/api/queued/','/api/');
+  }
+  next();
+});
 const parseDashboardJson = express.json({
   verify(req, res, buffer) {
     req.rawBody = Buffer.from(buffer);
@@ -2821,7 +2832,33 @@ app.delete(
 );
 
 // إرسال رسالة من الداشبورد
+app.get('/api/send-queue/config', requireAuth, requireConversationRole, async (req, res) => {
+  try { await durableSendQueue.store.ready(); res.json({ready:true,protocolVersion:1}); }
+  catch { res.status(503).json({ready:false,protocolVersion:1,error:'SEND_QUEUE_NOT_READY'}); }
+});
+app.get('/api/send-queue/:sessionId', requireAuth, requireConversationRole, async (req, res) => {
+  if (!await authorizeConversationRequest(req,res,req.params.sessionId)) return;
+  try { res.json({sessionId:req.params.sessionId,generation:await durableSendQueue.store.generation(req.params.sessionId),items:await durableSendQueue.store.snapshot(req.params.sessionId)}); }
+  catch { res.status(503).json({error:'SEND_QUEUE_UNAVAILABLE'}); }
+});
+app.post('/api/send-queue/:sessionId/cancel', requireAuth, requireConversationRole, async (req,res) => {
+  if (!await authorizeConversationRequest(req,res,req.params.sessionId)) return;
+  try { res.json({success:true,...await durableSendQueue.store.cancel(req.params.sessionId),inFlightMayComplete:true}); }
+  catch { res.status(503).json({error:'QUEUE_CANCEL_UNCONFIRMED'}); }
+});
+app.post('/api/send-queue/:sessionId/:id/resolve-unknown', requireAuth, requireConversationRole, async (req,res) => {
+  if (!await authorizeConversationRequest(req,res,req.params.sessionId)) return;
+  if(req.body?.confirmedNoResend!==true)return res.status(400).json({error:'EXPLICIT_REVIEW_REQUIRED'});
+  try { res.json({success:true,resolved:await durableSendQueue.store.resolve(req.params.sessionId,req.params.id)}); }
+  catch { res.status(503).json({error:'QUEUE_RESOLUTION_UNCONFIRMED'}); }
+});
 app.post('/api/send-message', requireAuth, requireConversationAccess(), async (req, res) => {
+  if(req.originalUrl?.startsWith('/api/queued/')&&req.body?.messageKind&&req.body.messageKind!=='text')
+    return res.status(422).json({error:'QUEUED_TEXT_ENDPOINT_ONLY'});
+  if (!req.body?.messageKind || req.body.messageKind === 'text') {
+    if (typeof req.body?.message!=='string'||!req.body.message.trim()) return res.status(400).json({error:'message is required'});
+    return acceptDurableSend(req,res,[{kind:'text',payload:{message:req.body.message,messageKind:'text',replyTo:req.body.replyTo||null,agentName:req.user?.displayName||req.user?.username||'Agent'}}]);
+  }
   if (getConversationChannel(req.body?.sessionId) === 'instagram') {
     try { return res.json(await instagramService.send({ ...req.body, agentName: req.user?.displayName || req.user?.username || 'Agent' })); }
     catch (error) { return res.status(error.status || 503).json({ error: error.message }); }
@@ -3919,6 +3956,37 @@ async function sendSavedMediaToSession(item, sessionId, agentName, caption = '')
 // مربوط بطلب HTTP واحد بيستنى لحد ما كل العناصر تتبعت — عشان لو الأدمن/
 // الإيجنت قفل الداشبورد أو خرج من التطبيق، الإرسال يكمل لوحده، والداشبورد
 // يقدر يتابع التقدم (كام اتبعت من كام) عن طريق polling على الجوب لحد ما يخلص
+// Primary content-send path. Uses the existing PostgreSQL pool; no automatic DDL
+// and no direct-send fallback when persistence is unavailable.
+const durableSendQueue = new SendQueue({
+  store:new PgSendQueueStore(pool),
+  onError:()=>console.error('Dashboard send queue unavailable; no automatic resend of in-flight items'),
+  dispatch:async row=>{
+    const account=findDashboardAccountByUsername(row.owner_name);
+    if(!account||!await canRequestAccessConversation({user:account},row.session_id))throw sendQueueFault('SEND_PERMISSION_REVOKED',403);
+    if(row.kind==='saved')return sendSavedMediaToSession(row.payload.item,row.session_id,row.payload.agentName,row.payload.caption);
+    if(row.kind==='media')return sendDashboardMediaToChannel({...row.payload,sessionId:row.session_id});
+    const p={...row.payload,sessionId:row.session_id};
+    if(getConversationChannel(row.session_id)==='instagram')return instagramService.send({...p,requestId:row.id});
+    const url=getDashboardSendWebhookUrl(row.session_id);
+    if(!url)throw sendQueueFault('SEND_WEBHOOK_NOT_CONFIGURED');
+    const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','x-api-key':process.env.INTERNAL_API_TOKEN||''},
+      body:JSON.stringify(p),redirect:'error',signal:AbortSignal.timeout(110000)});
+    const data=await response.json();
+    if(!response.ok||data.success!==true)throw new Error('SEND_RESULT_UNKNOWN');
+    if(getConversationChannel(row.session_id)==='whatsapp')await stampLatestAgentMessage(row.session_id,p.agentName,'text',p.message||'',p.replyTo);
+    return data;
+  }
+});
+async function acceptDurableSend(req,res,items,identity){
+  try {
+    const result=await durableSendQueue.enqueue({sessionId:String(req.body.sessionId||'').trim(),owner:req.user.username,
+      requestId:req.headers['idempotency-key'],generation:Number(req.headers['x-send-queue-generation']),items,identity});
+    return res.status(202).json(result);
+  } catch(error) {
+    return res.status(error.status||503).json({error:error.definitive?error.code:'SEND_QUEUE_UNAVAILABLE'});
+  }
+}
 const sendMediaJobs = new Map();
 let sendMediaJobCounter = 0;
 
@@ -4364,9 +4432,8 @@ app.post('/api/saved-media-items/:id/send', requireAuth, requireConversationAcce
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    const job = startSendMediaJob(result.rows, sessionId, agentName, caption, req.user);
-
-    res.json({ success: true, jobId: job.id, total: job.total });
+    return acceptDurableSend(req,res,result.rows.map(item=>({kind:'saved',payload:{item,agentName,caption}})),
+      {sessionId,ids:result.rows.map(item=>item.id),caption});
   } catch (err) {
     console.error('saved-media send error:', err);
     res.status(500).json({
@@ -4405,9 +4472,8 @@ app.post('/api/saved-media-items/send-batch', requireAuth, requireConversationAc
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    const job = startSendMediaJob(result.rows, sessionId, agentName, '', req.user);
-
-    res.json({ success: true, jobId: job.id, total: job.total });
+    return acceptDurableSend(req,res,result.rows.map(item=>({kind:'saved',payload:{item,agentName,caption:''}})),
+      {sessionId,ids:result.rows.map(item=>item.id)});
   } catch (err) {
     console.error('saved-media batch send error:', err);
     res.status(500).json({
@@ -4444,9 +4510,8 @@ app.post('/api/saved-media-folders/:id/send', requireAuth, requireConversationAc
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    const job = startSendMediaJob(result.rows, sessionId, agentName, '', req.user);
-
-    res.json({ success: true, jobId: job.id, total: job.total });
+    return acceptDurableSend(req,res,result.rows.map(item=>({kind:'saved',payload:{item,agentName,caption:''}})),
+      {sessionId,folderId,ids:result.rows.map(item=>item.id)});
   } catch (err) {
     console.error('saved-media folder send error:', err);
     res.status(500).json({
@@ -4501,6 +4566,7 @@ app.post(
   async (req, res) => {
   let originalFilePath = null;
   let finalFilePath = null;
+  let queueContentHash = null;
 
   try {
     const agentName =
@@ -4527,6 +4593,7 @@ app.post(
     }
 
     originalFilePath = req.file.path;
+    queueContentHash=crypto.createHash('sha256').update(await fs.promises.readFile(originalFilePath)).digest('hex');
     finalFilePath = originalFilePath;
 
     let finalFileName = req.file.filename;
@@ -4721,72 +4788,8 @@ app.post(
       }
     }
 
-    if (getConversationChannel(sessionId) === 'instagram') {
-      try { const data = await sendDashboardMediaToChannel({ sessionId, caption, messageKind, fileUrl, thumbnailUrl, agentName, source: 'attach', replyTo: req.body.replyTo || null });
-        return res.json({ success: true, channel: 'instagram', url: fileUrl, data }); }
-      catch (error) { return res.status(error.status || 503).json({ error: error.message }); }
-    }
-    const sendWebhookUrl = getDashboardSendWebhookUrl(sessionId);
-    if (!sendWebhookUrl) {
-      return res.status(503).json({
-        error: `${getConversationChannel(sessionId)} send webhook is not configured`
-      });
-    }
-
-    if (getConversationChannel(sessionId) === "messenger") {
-      const messengerKind = messageKind;
-
-      res.json({
-        success: true,
-        channel: "messenger",
-        url: fileUrl,
-        thumbnailUrl,
-        messageKind: messengerKind,
-        queued: true
-      });
-
-      sendDashboardMediaToChannel({
-        sessionId,
-        caption,
-        messageKind: messengerKind,
-        fileUrl,
-        thumbnailUrl,
-        agentName,
-        source: 'attach'
-      })
-        .catch((err) => {
-          console.error("Messenger background media send failed:", err);
-        });
-
-      return;
-    }
-
-    let data;
-    try {
-      data = await sendDashboardMediaToChannel({
-        sessionId,
-        caption,
-        messageKind,
-        fileUrl,
-        thumbnailUrl,
-        agentName,
-        source: 'attach'
-      });
-    } catch (err) {
-      return res.status(500).json({
-        error: "Failed to send media via n8n",
-        details: err.details || { error: err.message }
-      });
-    }
-
-    res.json({
-      success: true,
-      url: fileUrl,
-      thumbnailUrl,
-      messageKind,
-      data
-    });
-
+    return acceptDurableSend(req,res,[{kind:'media',payload:{sessionId,caption,messageKind,fileUrl,thumbnailUrl,agentName,source:'attach',replyTo:req.body.replyTo||null}}],
+      {sessionId,caption,messageKind,replyTo:req.body.replyTo||null,fileHash:queueContentHash});
   } catch (err) {
     console.error("send-media error:", err);
 
@@ -5347,6 +5350,7 @@ app.post('/api/gallery/items/:fileId/reorder', requireAuth, requireGallery, asyn
 
 const PORT = process.env.PORT || 3000;
 
+durableSendQueue.start();
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
