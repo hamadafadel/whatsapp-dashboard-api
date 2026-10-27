@@ -468,15 +468,24 @@ const N8N_MESSENGER_WEBHOOK_URL =
 const N8N_FB_SEND_WEBHOOK_URL =
   process.env.N8N_FB_SEND_WEBHOOK_URL || '';
 
-// فولدر جوجل درايف الرئيسي لمعرض الصور، وفولدر رفعيات content_team1 الخاص بيه
-const GALLERY_ROOT_FOLDER_ID =
-  process.env.GALLERY_ROOT_FOLDER_ID || '1YWEZuUiJfHsqHEjrHX-XV36inomkRoAc';
-
-// الفولدر الفرعي المخصص لرفعيات content_team1 بس — لازم يتعمل يدويًا في
-// درايف جوه الفولدر الرئيسي وتتحط الـ ID بتاعته هنا، عشان رفعياته تتحفظ
-// في مكان ثابت ومعروف بدل ما ندور عليه أو ننشئه ديناميكيًا كل مرة
-const GALLERY_UPLOAD_FOLDER_ID =
-  process.env.GALLERY_UPLOAD_FOLDER_ID || GALLERY_ROOT_FOLDER_ID;
+// Environment-only folder configuration. Legacy names are temporary aliases,
+// never a fallback for an explicitly configured but invalid new value.
+function readGalleryFolderSetting(name, legacyName) {
+  const source = Object.hasOwn(process.env, name) ? name : legacyName;
+  const value = String(process.env[source] ?? '').trim();
+  // Conservative syntax guard, not proof of Drive existence or permissions.
+  const valid = /^[A-Za-z0-9_-]{10,200}$/.test(value) &&
+    !/^(?:0+|change[_-]?me|(?:your[_-])?folder[_-]id(?:[_-]here)?|undefined|null)$/i.test(value);
+  return {
+    value: valid ? value : '',
+    error: valid ? null : { variable: name, source, reason: value ? 'INVALID_FOLDER_ID' : 'MISSING_FOLDER_ID' }
+  };
+}
+const gallerySharingFolderSetting = readGalleryFolderSetting('GALLERY_FOR_SHARING_FOLDER_ID', 'GALLERY_ROOT_FOLDER_ID');
+const galleryContentFolderSetting = readGalleryFolderSetting('GALLERY_FROM_CONTENT_FOLDER_ID', 'GALLERY_UPLOAD_FOLDER_ID');
+const GALLERY_FOR_SHARING_FOLDER_ID = gallerySharingFolderSetting.value;
+const GALLERY_FROM_CONTENT_FOLDER_ID = galleryContentFolderSetting.value;
+const galleryFolderConfigurationErrors = [gallerySharingFolderSetting.error, galleryContentFolderSetting.error].filter(Boolean);
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
@@ -672,6 +681,14 @@ function canUseTemporaryOrderConfirmationAccess(req, sessionId, accessState) {
 function requireGallery(req, res, next) {
   if (req.user?.role !== 'gallery' && req.user?.role !== 'admin') {
     return res.status(403).json({ error: 'Gallery access only' });
+  }
+
+  if (galleryFolderConfigurationErrors.length) {
+    return res.status(503).json({
+      code: 'GALLERY_CONFIGURATION_ERROR',
+      error: 'Gallery folder configuration is missing or invalid: ' + galleryFolderConfigurationErrors.map(item => item.variable).join(', '),
+      details: galleryFolderConfigurationErrors
+    });
   }
 
   next();
@@ -4985,14 +5002,11 @@ async function fetchGalleryFolderContents(folderId, { includeUploadFolder } = {}
   const folders = Array.isArray(foldersData.folders) ? foldersData.folders : [];
   let items = Array.isArray(itemsData.items) ? itemsData.items : [];
 
-  if (
-    includeUploadFolder &&
-    GALLERY_UPLOAD_FOLDER_ID &&
-    GALLERY_UPLOAD_FOLDER_ID !== GALLERY_ROOT_FOLDER_ID &&
-    !folders.some((f) => f.id === GALLERY_UPLOAD_FOLDER_ID)
-  ) {
-    folders.push({
-      id: GALLERY_UPLOAD_FOLDER_ID,
+  if (includeUploadFolder && GALLERY_FROM_CONTENT_FOLDER_ID !== GALLERY_FOR_SHARING_FOLDER_ID) {
+    const uploadFolder = folders.find((folder) => folder.id === GALLERY_FROM_CONTENT_FOLDER_ID);
+    if (uploadFolder) uploadFolder.isOwnUploadFolder = true;
+    else folders.push({
+      id: GALLERY_FROM_CONTENT_FOLDER_ID,
       name: 'From Content Team',
       isOwnUploadFolder: true
     });
@@ -5029,7 +5043,7 @@ async function applyGalleryItemOrder(items) {
 // برّه الفولدر الرئيسي تمامًا في درايف
 app.get('/api/gallery/browse', requireAuth, requireGallery, async (req, res) => {
   try {
-    const data = await fetchGalleryFolderContents(GALLERY_ROOT_FOLDER_ID, {
+    const data = await fetchGalleryFolderContents(GALLERY_FOR_SHARING_FOLDER_ID, {
       includeUploadFolder: true
     });
     res.json(data);
@@ -5180,7 +5194,7 @@ app.post(
 
       const targetFolderId =
         String(req.body?.targetFolderId || '').trim() ||
-        GALLERY_UPLOAD_FOLDER_ID;
+        GALLERY_FROM_CONTENT_FOLDER_ID;
 
       const formData = new FormData();
       formData.append('action', 'upload_file');
@@ -5256,7 +5270,7 @@ async function createGalleryFolder(req, res, defaultParentFolderId) {
 }
 
 app.post('/api/gallery/browse/folders', requireAuth, requireGallery, (req, res) => {
-  createGalleryFolder(req, res, GALLERY_ROOT_FOLDER_ID);
+  createGalleryFolder(req, res, GALLERY_FOR_SHARING_FOLDER_ID);
 });
 
 app.post('/api/gallery/browse/:folderId/folders', requireAuth, requireGallery, (req, res) => {
@@ -5294,7 +5308,7 @@ app.post('/api/gallery/items/:nodeId/move', requireAuth, requireGallery, async (
   try {
     // فاضي = نقل لجذر المعرض (الفولدر الرئيسي)
     const targetFolderId =
-      String(req.body?.targetFolderId || '').trim() || GALLERY_ROOT_FOLDER_ID;
+      String(req.body?.targetFolderId || '').trim() || GALLERY_FOR_SHARING_FOLDER_ID;
 
     const response = await callGalleryWebhook({
       action: 'move_file',
