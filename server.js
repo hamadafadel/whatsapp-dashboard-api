@@ -4963,10 +4963,10 @@ async function proxyGalleryBinary(req, res, payload) {
       res.setHeader('Content-Disposition', contentDisposition);
     }
 
-    // نفس الصورة بترجع تتحمّل كل مرة تفتح فيها الفولدر من غير الكاش ده —
-    // الملف مربوط بـ fileId ثابت، فمن الآمن نخلي المتصفح يحتفظ بنسخة منه
+    // Drive files can change without changing fileId. Do not freeze their
+    // binary content; thumbnail/cover caching remains independent.
     if (payload.action === 'download_file') {
-      res.setHeader('Cache-Control', 'private, max-age=86400');
+      res.setHeader('Cache-Control', 'private, no-store');
     }
 
     Readable.fromWeb(response.body).pipe(res);
