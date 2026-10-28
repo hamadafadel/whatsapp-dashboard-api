@@ -5016,8 +5016,126 @@ async function fetchGalleryFolderContents(folderId, { includeUploadFolder } = {}
     items = await applyGalleryItemOrder(items);
   }
 
-  return { folders, items };
+  const orderState = await readGalleryFolderOrder(folderId, pool, items.map((item) => item.id));
+  items = sortGalleryFolderItems(items, orderState);
+  return { folders, items, orderState: {
+    mode: orderState.mode, revision: orderState.revision, available: orderState.available
+  } };
 }
+
+// Folder preferences live only in PostgreSQL; Drive ordering is untouched.
+async function readGalleryFolderOrder(folderId, client = pool, liveIds = null) {
+  try {
+    const result = await client.query(
+      'SELECT mode, file_ids, revision FROM gallery_folder_order WHERE folder_id = $1', [folderId]
+    );
+    let row = result.rows[0];
+    if (row && liveIds && liveIds.some((id) => !row.file_ids.includes(id))) {
+      // Anchor newly observed files once. Atomic append preserves another
+      // reader's discoveries; never replace a snapshot or prune on a GET.
+      const updated = await client.query(
+        `UPDATE gallery_folder_order AS g SET
+           file_ids = g.file_ids || ARRAY(SELECT id FROM unnest($2::text[]) WITH ORDINALITY AS live(id, pos)
+             WHERE NOT (id = ANY(g.file_ids)) ORDER BY pos),
+           revision = g.revision + 1, updated_at = now()
+         WHERE folder_id = $1 AND EXISTS
+           (SELECT 1 FROM unnest($2::text[]) AS live(id) WHERE NOT (id = ANY(g.file_ids)))
+         RETURNING mode, file_ids, revision`, [folderId, [...new Set(liveIds)]]
+      );
+      if (!updated.rows.length) return readGalleryFolderOrder(folderId, client);
+      row = updated.rows[0];
+    }
+    return { mode: row?.mode || 'custom', fileIds: row?.file_ids || [],
+      revision: Number(row?.revision || 0), available: true };
+  } catch (err) {
+    // Rolling deployment: browsing still works before the manual migration.
+    if (err.code === '42P01') return { mode: 'custom', fileIds: [], revision: 0, available: false };
+    throw err;
+  }
+}
+
+function sortGalleryFolderItems(items, state) {
+  if (state.mode === 'alphabetical') {
+    const collator = new Intl.Collator(['ar', 'en'], { numeric: true, sensitivity: 'base' });
+    return [...items].sort((a, b) => collator.compare(a.name || '', b.name || '') || String(a.id).localeCompare(String(b.id)));
+  }
+  const rank = new Map(state.fileIds.map((id, index) => [id, index]));
+  // Files not present in the saved snapshot are appended, never interleaved.
+  return [...items].sort((a, b) => (rank.get(a.id) ?? rank.size) - (rank.get(b.id) ?? rank.size));
+}
+
+async function assertGalleryOrderAccess(req, folderId) {
+  const pathIds = req.body?.folderPath;
+  if (!Array.isArray(pathIds) || pathIds.length > 100 ||
+      pathIds.some((id) => typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) ||
+      new Set(pathIds).size !== pathIds.length || pathIds.at(-1) !== folderId) {
+    return false;
+  }
+  // Never trust the client-side canWriteHere flag or a supplied ancestor ID.
+  const roots = req.user.role === 'admin'
+    ? [GALLERY_FOR_SHARING_FOLDER_ID, GALLERY_FROM_CONTENT_FOLDER_ID]
+    : [GALLERY_FROM_CONTENT_FOLDER_ID];
+  const rootIndex = pathIds.findIndex((id) => roots.includes(id));
+  if (rootIndex < 0 && req.user.role !== 'admin') return false;
+  let parentId = rootIndex < 0 ? GALLERY_FOR_SHARING_FOLDER_ID : pathIds[rootIndex];
+  for (let i = rootIndex + 1; i < pathIds.length; i++) {
+    const response = await callGalleryWebhook({ action: 'list_folders', rootFolderId: parentId });
+    const data = await response.json();
+    if (!response.ok) throw new Error('Unable to verify Gallery folder access');
+    if (!Array.isArray(data.folders) || !data.folders.some((f) => f.id === pathIds[i])) return false;
+    parentId = pathIds[i];
+  }
+  return true;
+}
+
+app.post('/api/gallery/folders/:folderId/order', requireAuth, requireGallery, async (req, res) => {
+  let client;
+  try {
+    const folderId = req.params.folderId;
+    const { mode, fileIds, revision } = req.body || {};
+    if (!/^[A-Za-z0-9_-]+$/.test(folderId) || !['custom', 'alphabetical'].includes(mode) ||
+        !Number.isSafeInteger(revision) || revision < 0 || !Array.isArray(fileIds) || fileIds.length > 10000 ||
+        fileIds.some((id) => typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) || new Set(fileIds).size !== fileIds.length) {
+      return res.status(400).json({ error: 'Invalid Gallery order' });
+    }
+    if (!await assertGalleryOrderAccess(req, folderId)) return res.status(403).json({ error: 'Cannot reorder this folder' });
+    const listing = await fetchGalleryFolderContents(folderId);
+    if (!listing.orderState.available) return res.status(503).json({ error: 'Gallery order migration is required' });
+    const liveIds = new Set(listing.items.map((item) => item.id));
+    if (fileIds.length !== liveIds.size || fileIds.some((id) => !liveIds.has(id))) {
+      return res.status(409).json({ error: 'Folder contents changed. Refresh before sorting.' });
+    }
+    client = await pool.connect();
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended('gallery-order:' || $1::text, 0))", [folderId]);
+    const saved = await readGalleryFolderOrder(folderId, client);
+    if (saved.revision !== revision) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Folder order changed on another device. Refresh and try again.' });
+    }
+    // Alphabetical mode does not destroy the previously saved Custom layout.
+    const keepCustom = mode === 'alphabetical' || req.body.restoreCustom === true;
+    const savedIds = new Set(saved.fileIds);
+    const customIds = !keepCustom ? fileIds : [
+      ...saved.fileIds.filter((id) => liveIds.has(id)),
+      ...listing.items.map((item) => item.id).filter((id) => !savedIds.has(id))
+    ];
+    await client.query(
+      `INSERT INTO gallery_folder_order (folder_id, mode, file_ids, revision)
+       VALUES ($1, $2, $3::text[], 1)
+       ON CONFLICT (folder_id) DO UPDATE SET mode = $2, file_ids = $3::text[],
+         revision = gallery_folder_order.revision + 1, updated_at = now()`,
+      [folderId, mode, customIds]
+    );
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (err) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    res.status(err.code === '42P01' ? 503 : 500).json({ error: 'Unable to save Gallery order' });
+  } finally {
+    if (client) client.release();
+  }
+});
 
 // بيحط ترتيب مخصص (لو موجود) على كل ملف، وبيرتب القايمة بيه. الملفات اللي
 // ما اتعرضتش عليها إعادة ترتيب لسه بتاخد ترتيب افتراضي بمسافات واسعة بينهم
