@@ -1,4 +1,4 @@
-# Readiness-only deployment. Replace network/mount paths before deployment.
+# Readiness-only deployment. Paths are discovered by setup-fcm-worker.py.
 # Switching to --run requires separate explicit sending approval.
 # Do not change the API resource/Dockerfile. No ports or public domain required.
 services:
@@ -29,7 +29,7 @@ services:
       DASHBOARD_GALLERY_PASSWORD: ${DASHBOARD_GALLERY_PASSWORD:-}
     volumes:
       - type: bind
-        source: /REPLACE_WITH_EXISTING_HOST_SECRET_FILE
+        source: ${FCM_WORKER_FIREBASE_FILE:?required}
         target: /run/secrets/firebase-service-account.json
         read_only: true
         bind:
@@ -39,4 +39,4 @@ services:
 networks:
   database-network:
     external: true
-    name: REPLACE_WITH_EXISTING_DATABASE_NETWORK
+    name: ${FCM_WORKER_DB_NETWORK:?required}
