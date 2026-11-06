@@ -44,7 +44,9 @@ SOURCE_HASHES = {
 }
 
 class Stop(Exception):
-    pass
+    def __init__(self, code, details=None):
+        super().__init__(code)
+        self.details = details or {}
 
 def require(condition, code):
     if not condition:
@@ -53,6 +55,52 @@ def require(condition, code):
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         raise Stop('HTTP_REDIRECT_REFUSED')
+
+def request_label(url, method):
+    if url == BASE + '/applications/' + WORKER_APP + '/envs/bulk':
+        return 'worker_environment_' + method.lower()
+    if url == BASE + '/applications/' + WORKER_APP:
+        return 'worker_application_' + method.lower()
+    if url == BASE + '/applications/' + API_APP:
+        return 'backend_application_' + method.lower()
+    if url.startswith('https://api.github.com/repos/' + REPOSITORY + '/commits/'):
+        return 'github_revision_get'
+    return 'other_http_request'
+
+def safe_http_error(status, url, method, raw):
+    details = {'request': request_label(url, method), 'httpStatus': status}
+    # Never copy raw error text: validators can echo submitted secrets/values.
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return details
+    errors = payload.get('errors') if isinstance(payload, dict) else None
+    if not isinstance(errors, dict):
+        return details
+    allowed = {'domains', 'docker_compose_domains', 'is_auto_deploy_enabled', 'health_check_enabled',
+               'git_commit_sha', 'data', 'key', 'value', 'is_preview', 'is_literal', 'is_runtime',
+               'is_buildtime', 'is_multiline', 'is_shown_once', 'comment'}
+    rejected, codes = [], set()
+    for field, messages in list(errors.items())[:64]:
+        if not isinstance(field, str):
+            continue
+        leaf = re.sub(r'^data\.\d+\.', '', field)
+        if leaf in allowed:
+            rejected.append(leaf)
+        if not isinstance(messages, list):
+            messages = [messages]
+        for message in messages:
+            if not isinstance(message, str):
+                continue
+            if field == 'domains' and 'domains field cannot be used for dockercompose applications' in message:
+                codes.add('DOMAINS_NOT_ALLOWED_FOR_DOCKERCOMPOSE')
+            elif field == 'docker_compose_domains' and 'without docker_compose_raw' in message:
+                codes.add('COMPOSE_DEFINITION_NOT_LOADED')
+    details['rejectedFields'] = sorted(set(rejected))
+    details['validationCodes'] = sorted(codes) or ['VALIDATION_FAILED_DETAILS_SUPPRESSED']
+    if len(rejected) < len(errors):
+        details['otherFieldsSuppressed'] = True
+    return details
 
 def http_json(url, token=None, method='GET', body=None):
     require(url.startswith(BASE + '/') if token else url.startswith('https://api.github.com/'), 'HTTP_DESTINATION_REFUSED')
@@ -67,7 +115,11 @@ def http_json(url, token=None, method='GET', body=None):
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
-        raise Stop('HTTP_STATUS_' + str(error.code) + '_' + method) from None
+        try:
+            details = safe_http_error(error.code, url, method, error.read(16384))
+        finally:
+            error.close()
+        raise Stop('HTTP_STATUS_' + str(error.code) + '_' + method, details) from None
     except (urllib.error.URLError, ValueError):
         raise Stop('HTTP_REQUEST_FAILED_' + method) from None
 
@@ -162,6 +214,18 @@ def verify_applications(api, backend_app, worker_app):
         require(app.get('git_repository') == REPOSITORY and app.get('git_branch') == 'main', 'APPLICATION_REPOSITORY_MISMATCH')
     require(worker_app.get('build_pack') == 'dockercompose', 'WORKER_BUILD_PACK_MISMATCH')
     require(worker_app.get('docker_compose_location') == '/compose.fcm-worker.yaml', 'COMPOSE_LOCATION_MISMATCH')
+    require(worker_app.get('fqdn') in ['', None], 'WORKER_EXISTING_DOMAIN_REQUIRES_REVIEW')
+    domains = worker_app.get('docker_compose_domains')
+    if isinstance(domains, str) and domains:
+        try:
+            domains = json.loads(domains)
+        except ValueError:
+            raise Stop('WORKER_DOMAIN_CONFIGURATION_UNREADABLE') from None
+    if domains:
+        items = domains.values() if isinstance(domains, dict) else domains if isinstance(domains, list) else None
+        require(items is not None, 'WORKER_DOMAIN_CONFIGURATION_UNREADABLE')
+        require(all(isinstance(item, dict) and not item.get('domain') and not item.get('url') for item in items),
+                'WORKER_EXISTING_DOMAIN_REQUIRES_REVIEW')
     require(backend_app.get('destination_id') is not None and worker_app.get('destination_id') is not None, 'APPLICATION_DESTINATION_REQUIRED')
     require(backend_app.get('destination_id') == worker_app.get('destination_id') and
             backend_app.get('destination_type') == worker_app.get('destination_type'), 'APPLICATION_DESTINATION_MISMATCH')
@@ -280,27 +344,38 @@ def main():
         readiness = safe_readiness(command(compose + ['run', '--rm', '--no-deps', '-T', '--entrypoint', 'node',
                                                     'fcm-worker', 'android-push-service.js', '--check'], env=child_env, timeout=90))
         # Only the NEW application is modified. Never call deploy/start/restart endpoints.
-        api('/applications/' + WORKER_APP, method='PATCH', body={'is_auto_deploy_enabled': False, 'domains': '',
-            'docker_compose_domains': [], 'health_check_enabled': False, 'git_commit_sha': revision})
+        # beta.473 rejects `domains` for Docker Compose, even the empty string.
+        # An empty docker_compose_domains also requires loaded docker_compose_raw.
+        # Public domains were checked absent above, so neither field needs updating.
+        acknowledged = api('/applications/' + WORKER_APP, method='PATCH', body={
+            'is_auto_deploy_enabled': False, 'health_check_enabled': False, 'git_commit_sha': revision})
+        require(isinstance(acknowledged, dict) and acknowledged.get('uuid') == WORKER_APP, 'WORKER_SETTINGS_PATCH_NOT_ACKNOWLEDGED')
         payload = {'data': [{'key': k, 'value': v, 'is_preview': False, 'is_literal': True,
                             'is_runtime': True, 'is_buildtime': False, 'is_shown_once': True} for k, v in env.items()]}
         api('/applications/' + WORKER_APP + '/envs/bulk', method='PATCH', body=payload)
         after = api('/applications/' + WORKER_APP)
-        require(after.get('git_commit_sha') == revision and after.get('fqdn') in ['', None]
-                and not after.get('is_auto_deploy_enabled'), 'WORKER_SETTINGS_SAVE_NOT_CONFIRMED')
+        verify_applications(api, backend_app, after)
+        # beta.473 stores this boolean in application.settings, which GET may not
+        # expose. Never treat a missing value as false. The PATCH acknowledgement
+        # confirms the write; verify the actual value additionally when returned.
+        settings = after.get('settings') or {}
+        auto_deploy = after.get('is_auto_deploy_enabled', settings.get('is_auto_deploy_enabled'))
+        require(after.get('git_commit_sha') == revision and auto_deploy in [None, False, 0], 'WORKER_SETTINGS_SAVE_NOT_CONFIRMED')
         # Read-back of shown-once secrets is intentionally not forced or printed.
         live = json.loads(command(['docker', 'inspect'] + list(baseline)))
         require(all((c['State']['StartedAt'], c.get('RestartCount', 0)) == baseline[c['Id']]
                     and c['State']['Running'] for c in live), 'EXISTING_CONTAINER_STATE_CHANGED')
         print(json.dumps({'status': 'CONFIGURED_AND_READINESS_VERIFIED', 'workerApp': WORKER_APP,
                           'sourceRevision': revision, 'productionServicesUnchanged': True,
-                          'coolifyWorkerNotStarted': True, **readiness}))
+                          'coolifyWorkerNotStarted': True,
+                          'autoDeployVerification': 'READ_BACK_FALSE' if auto_deploy is not None else 'PATCH_ACKNOWLEDGED_NOT_EXPOSED_BY_GET',
+                          **readiness}))
 
 if __name__ == '__main__':
     try:
         main()
     except Stop as error:
-        print(json.dumps({'status': 'STOPPED', 'reason': str(error), 'sendingEnabled': False}), flush=True)
+        print(json.dumps({'status': 'STOPPED', 'reason': str(error), 'sendingEnabled': False, **error.details}), flush=True)
         raise SystemExit(1)
     except (Exception, KeyboardInterrupt):
         print(json.dumps({'status': 'STOPPED', 'reason': 'UNEXPECTED_FAILURE_DETAILS_SUPPRESSED', 'sendingEnabled': False}), flush=True)
