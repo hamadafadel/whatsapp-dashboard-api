@@ -29,7 +29,7 @@ services:
       DASHBOARD_GALLERY_PASSWORD: ${DASHBOARD_GALLERY_PASSWORD:-}
     volumes:
       - type: bind
-        source: ${FCM_WORKER_FIREBASE_FILE:?required}
+        source: /data/coolify/applications/mm88aewbk82d42ss62l1qfr2/run/secrets/firebase-service-account.json
         target: /run/secrets/firebase-service-account.json
         read_only: true
         bind:
