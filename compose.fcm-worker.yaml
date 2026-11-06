@@ -1,0 +1,42 @@
+# Readiness-only deployment. Replace network/mount paths before deployment.
+# Switching to --run requires separate explicit sending approval.
+# Do not change the API resource/Dockerfile. No ports or public domain required.
+services:
+  fcm-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.fcm-worker
+    init: true
+    restart: "no"
+    stop_grace_period: 30s
+    command:
+      - --check
+    environment:
+      DB_HOST: ${DB_HOST:?required}
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:?required}
+      DB_USER: ${DB_USER:?required}
+      DB_PASSWORD: ${DB_PASSWORD:?required}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?required}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-service-account.json
+      ANDROID_PUSH_TOKEN_ENCRYPTION_KEY: ${ANDROID_PUSH_TOKEN_ENCRYPTION_KEY:?required}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:?required}
+      DASHBOARD_AGENT1_USERNAME: ${DASHBOARD_AGENT1_USERNAME:-}
+      DASHBOARD_AGENT1_PASSWORD: ${DASHBOARD_AGENT1_PASSWORD:-}
+      DASHBOARD_CONFIRMATION_USERNAME: ${DASHBOARD_CONFIRMATION_USERNAME:-}
+      DASHBOARD_CONFIRMATION_PASSWORD: ${DASHBOARD_CONFIRMATION_PASSWORD:-}
+      DASHBOARD_GALLERY_USERNAME: ${DASHBOARD_GALLERY_USERNAME:-}
+      DASHBOARD_GALLERY_PASSWORD: ${DASHBOARD_GALLERY_PASSWORD:-}
+    volumes:
+      - type: bind
+        source: /REPLACE_WITH_EXISTING_HOST_SECRET_FILE
+        target: /run/secrets/firebase-service-account.json
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - database-network
+networks:
+  database-network:
+    external: true
+    name: REPLACE_WITH_EXISTING_DATABASE_NETWORK

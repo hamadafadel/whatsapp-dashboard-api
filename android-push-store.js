@@ -2,7 +2,7 @@
 const crypto=require('crypto');
 const {fault,sameHash}=require('./android-push');
 class PgAndroidPushStore {
- constructor(pool){this.pool=pool;}
+ constructor(pool,scope={}){this.pool=pool;this.scope={eventId:scope.eventId||null,notBefore:scope.notBefore||null,bindingId:scope.bindingId||null};}
  async transaction(work){const c=await this.pool.connect();try{await c.query('BEGIN');const value=await work(c);await c.query('COMMIT');return value;}catch(e){await c.query('ROLLBACK').catch(()=>{});if(e.code==='23505')throw fault('DEVICE_CONFLICT',409);throw e;}finally{c.release();}}
  async register(p){return this.transaction(async c=>{
   await c.query("SELECT pg_advisory_xact_lock(hashtextextended('android-push-device:'||$1,0))",[p.installationId]);
@@ -57,7 +57,8 @@ class PgAndroidPushStore {
   ORDER BY e.created_at DESC,e.event_id DESC LIMIT 101`,[bindingId,before||null])).rows;}
  async expand(){return this.transaction(async c=>{
   const events=(await c.query(`SELECT event_id FROM public.android_notification_events WHERE expanded_at IS NULL AND expires_at>clock_timestamp()
-   ORDER BY created_at,event_id FOR UPDATE SKIP LOCKED LIMIT 100`)).rows;
+   AND ($1::uuid IS NULL OR event_id=$1) AND ($2::timestamptz IS NULL OR created_at >= $2)
+   ORDER BY created_at,event_id FOR UPDATE SKIP LOCKED LIMIT 100`,[this.scope.eventId,this.scope.notBefore])).rows;
   for(const e of events){
    await c.query(`INSERT INTO public.android_notification_deliveries(event_id,binding_id)
     SELECT e.event_id,d.binding_id FROM public.android_notification_events e CROSS JOIN public.android_push_devices d
@@ -70,12 +71,14 @@ class PgAndroidPushStore {
   const lease=crypto.randomUUID();
   const row=(await this.pool.query(`WITH candidate AS (
    SELECT d.delivery_id FROM public.android_notification_deliveries d JOIN public.android_notification_events e USING(event_id)
-   WHERE e.expires_at>clock_timestamp() AND ((d.status='pending' AND d.next_attempt_at<=clock_timestamp())
+   WHERE e.expires_at>clock_timestamp() AND ($2::uuid IS NULL OR e.event_id=$2)
+   AND ($3::timestamptz IS NULL OR e.created_at >= $3) AND ($4::uuid IS NULL OR d.binding_id=$4)
+   AND ((d.status='pending' AND d.next_attempt_at<=clock_timestamp())
     OR (d.status='sending' AND d.lease_until<=clock_timestamp()))
    ORDER BY d.created_at,d.delivery_id FOR UPDATE OF d SKIP LOCKED LIMIT 1)
    UPDATE public.android_notification_deliveries d SET status='sending',attempts=d.attempts+1,lease_id=$1,
     lease_until=clock_timestamp()+interval '60 seconds',updated_at=clock_timestamp()
-   FROM candidate c WHERE d.delivery_id=c.delivery_id RETURNING d.*`,[lease])).rows[0];
+   FROM candidate c WHERE d.delivery_id=c.delivery_id RETURNING d.*`,[lease,this.scope.eventId,this.scope.notBefore,this.scope.bindingId])).rows[0];
   return row||null;
  }
  async event(id){return (await this.pool.query(`SELECT e.*,m.message FROM public.android_notification_events e

@@ -1,7 +1,7 @@
 'use strict';
 const {fault,decryptToken,liveMessage}=require('./android-push');
 const INVALID_TOKEN=new Set(['messaging/registration-token-not-registered','messaging/invalid-registration-token']);
-const TEMPORARY=new Set(['messaging/server-unavailable','messaging/internal-error','messaging/quota-exceeded','app/network-error','app/network-timeout','PUSH_SEND_TIMEOUT']);
+const TEMPORARY=new Set(['messaging/server-unavailable','messaging/internal-error','messaging/quota-exceeded','app/network-error','app/network-timeout','PUSH_SEND_TIMEOUT','WORKER_STOPPING']);
 function retryDelay(attempt,random=Math.random,retryAfterMs=0){
  const base=Math.min(3600000,30000*2**Math.max(0,Math.min(10,attempt-1)));
  return Math.min(7200000,Math.max(base+Math.floor(base*0.2*random()),Number.isFinite(retryAfterMs)?retryAfterMs:0));
@@ -28,8 +28,8 @@ function createFirebaseSender({env=process.env,allowSend=false,sdkFactory}={}){
  send.prepare=prepare;return send;
 }
 class AndroidPushWorker {
- constructor({store,service,sender,env=process.env,allowDispatch=false,now=Date.now,random=Math.random,timeoutMs=15000}){
-  Object.assign(this,{store,service,sender,env,allowDispatch,now,random,timeoutMs});this.running=false;
+ constructor({store,service,sender,env=process.env,allowDispatch=false,now=Date.now,random=Math.random,timeoutMs=15000,canRun=()=>true}){
+  Object.assign(this,{store,service,sender,env,allowDispatch,now,random,timeoutMs,canRun});this.running=false;
  }
  async runOnce(limit=10){
   if(!this.allowDispatch)throw fault('PUSH_SENDING_DISABLED',503);
@@ -38,7 +38,7 @@ class AndroidPushWorker {
    // Configuration/ADC parsing fails before claiming jobs, not after marking a batch as failed.
    await this.sender.prepare?.();
    await this.store.expire();await this.store.expand();
-   for(let i=0;i<Math.min(100,Math.max(0,limit));i++){
+   for(let i=0;this.canRun()&&i<Math.min(100,Math.max(0,limit));i++){
     const claim=await this.store.claim();if(!claim)break;
     try{
      const event=await this.store.event(claim.event_id),device=await this.store.getDevice(claim.binding_id);
@@ -47,6 +47,7 @@ class AndroidPushWorker {
      }
      if(claim.attempts>8){await this.store.finish(claim,'failed',{code:'RETRY_LIMIT'});continue;}
      // An authorization lookup may outlast a lease. An old owner must never start a new send.
+     if(!this.canRun())break;
      if(this.store.renew&&!await this.store.renew(claim))continue;
      const token=decryptToken(device.token_cipher,device.binding_id,this.env);let timer;
      try{await Promise.race([this.sender(token,event.event_id,new Date(event.expires_at).getTime()-this.now()),

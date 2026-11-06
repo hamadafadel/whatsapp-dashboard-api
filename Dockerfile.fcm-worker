@@ -1,0 +1,8 @@
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY android-push.js android-push-store.js android-push-worker.js android-push-preflight.js android-push-worker-access.js android-push-service.js ./
+# Default is a read-only readiness check, never dispatch.
+ENTRYPOINT ["node", "android-push-service.js"]
+CMD ["--check"]

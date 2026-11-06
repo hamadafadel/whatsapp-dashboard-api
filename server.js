@@ -1457,11 +1457,7 @@ const androidPushService=createAndroidPushService({
 registerAndroidPushRoutes(app,{requireAuth,service:androidPushService});
 // Explicit future deployment command only. Firebase environment variables alone never enable delivery.
 if(require.main===module && process.argv.includes('--android-push-worker')) {
-  const {AndroidPushWorker,createFirebaseSender}=require('./android-push-worker');
-  const androidWorker=new AndroidPushWorker({store:androidPushStore,service:androidPushService,
-    sender:createFirebaseSender({allowSend:true}),allowDispatch:true});
-  const tick=()=>androidWorker.runOnce(50).catch(()=>console.error('Android push worker: retryable cycle failure'));
-  setInterval(tick,5000).unref();tick();
+  throw new Error('FCM_WORKER_SEPARATE_SERVICE_REQUIRED');
 }
 
 // Serialize broadcasts so asynchronous authorization cannot invert message order.
