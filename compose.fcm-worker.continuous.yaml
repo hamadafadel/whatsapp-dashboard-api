@@ -39,4 +39,4 @@ services:
 networks:
   database-network:
     external: true
-    name: ${FCM_WORKER_DB_NETWORK:?required}
+    name: coolify
