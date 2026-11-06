@@ -2,6 +2,8 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const {PgSendQueueStore, SendQueue, fault: sendQueueFault} = require('./send-queue');
+const {PgAndroidPushStore} = require('./android-push-store');
+const {createAndroidPushService,registerAndroidPushRoutes} = require('./android-push');
 const { Readable } = require('stream');
 
 const express = require('express');
@@ -1443,6 +1445,23 @@ function requireConversationAccess(options = {}) {
     const sessionId = req.params?.sessionId ?? req.body?.sessionId;
     if (await authorizeConversationRequest(req, res, sessionId, options)) next();
   };
+}
+
+// APIs only: no automatic DDL, Firebase initialization, outbox generation or sending worker.
+const androidPushStore=new PgAndroidPushStore(pool);
+const androidPushService=createAndroidPushService({
+  store:androidPushStore,findAccount:findDashboardAccountByUsername,
+  getAccess:getConversationAccessState,canAccess:canDashboardUserAccessConversation,
+  getCustomerName:getCustomerNameForSession
+});
+registerAndroidPushRoutes(app,{requireAuth,service:androidPushService});
+// Explicit future deployment command only. Firebase environment variables alone never enable delivery.
+if(require.main===module && process.argv.includes('--android-push-worker')) {
+  const {AndroidPushWorker,createFirebaseSender}=require('./android-push-worker');
+  const androidWorker=new AndroidPushWorker({store:androidPushStore,service:androidPushService,
+    sender:createFirebaseSender({allowSend:true}),allowDispatch:true});
+  const tick=()=>androidWorker.runOnce(50).catch(()=>console.error('Android push worker: retryable cycle failure'));
+  setInterval(tick,5000).unref();tick();
 }
 
 // Serialize broadcasts so asynchronous authorization cannot invert message order.
