@@ -4519,7 +4519,7 @@ app.post('/api/saved-media-items/send-batch', requireAuth, requireConversationAc
 app.post('/api/saved-media-folders/:id/send', requireAuth, requireConversationAccess(), async (req, res) => {
   try {
     const folderId = Number(req.params.id);
-    const { sessionId } = req.body || {};
+    const { sessionId, itemIds } = req.body || {};
 
     if (!folderId || !sessionId) {
       return res.status(400).json({
@@ -4527,23 +4527,40 @@ app.post('/api/saved-media-folders/:id/send', requireAuth, requireConversationAc
       });
     }
 
+    if (itemIds !== undefined &&
+        (!Array.isArray(itemIds) || !itemIds.length || itemIds.length > 100 ||
+         itemIds.some(id => !Number.isSafeInteger(id) || id <= 0) ||
+         new Set(itemIds).size !== itemIds.length)) {
+      return res.status(400).json({ error: 'Invalid ordered folder item IDs' });
+    }
+
     const result = await pool.query(
       `SELECT id, media_kind, media_url, thumbnail_url, file_path
-       FROM saved_media_items
-       WHERE folder_id = $1
-       ORDER BY id ASC`,
-      [folderId]
+       FROM (
+         SELECT id, media_kind, media_url, thumbnail_url, file_path,
+                COALESCE(sort_order, row_number() OVER (ORDER BY id) * 1000) AS display_order
+         FROM saved_media_items
+         WHERE folder_id = $1
+       ) AS folder_items
+       WHERE $2::int[] IS NULL OR id = ANY($2::int[])
+       ORDER BY display_order, id`,
+      [folderId, itemIds ?? null]
     );
 
-    if (!result.rows.length) {
+    const itemsById = new Map(result.rows.map(item => [item.id, item]));
+    if (itemIds && itemIds.some(id => !itemsById.has(id))) {
+      return res.status(409).json({ error: 'محتوى الفولدر تغيّر. افتحه مرة أخرى وراجع ترتيبه قبل الإرسال.' });
+    }
+    const items = itemIds ? itemIds.map(id => itemsById.get(id)) : result.rows;
+    if (!items.length) {
       return res.status(404).json({ error: 'Folder is empty or not found' });
     }
 
     const agentName =
       req.user?.displayName || req.user?.username || 'Agent';
 
-    return acceptDurableSend(req,res,result.rows.map(item=>({kind:'saved',payload:{item,agentName,caption:''}})),
-      {sessionId,folderId,ids:result.rows.map(item=>item.id)});
+    return acceptDurableSend(req,res,items.map(item=>({kind:'saved',payload:{item,agentName,caption:''}})),
+      {sessionId,folderId,ids:items.map(item=>item.id)});
   } catch (err) {
     console.error('saved-media folder send error:', err);
     res.status(500).json({
