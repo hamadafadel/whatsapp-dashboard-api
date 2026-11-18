@@ -1654,6 +1654,7 @@ app.get('/api/conversations-search', requireAuth, async (req, res) => {
   }
 });
 
+const { hydrateMessengerReplies } = require('./messenger-reply-preview');
 app.get('/api/messages/:sessionId', requireAuth, requireConversationAccess({ allowTemporary: true }), async (req, res) => {
   const { sessionId } = req.params;
   const limit = Math.min(
@@ -1750,7 +1751,7 @@ app.get('/api/messages/:sessionId', requireAuth, requireConversationAccess({ all
       : result.rows;
 
     res.json({
-      messages: pageRows,
+      messages: await hydrateMessengerReplies(pool, sessionId, pageRows),
       total: countResult.rows[0]?.total || 0,
       hasMore,
       nextBeforeId: pageRows[0]?.id || null,
