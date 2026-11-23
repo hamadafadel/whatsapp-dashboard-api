@@ -8,7 +8,7 @@ const {SendQueue}=require('../send-queue');
 const tools=templateTools();
 const raw=(components=[{type:'BODY',text:'أهلا {{2}} {{1}} {{1}}'}],extra={})=>({id:'123',name:'approved_test',language:'ar',status:'APPROVED',category:'UTILITY',components,...extra});
 const t=()=>normalizeTemplate(raw());
-const env={N8N_SEND_WEBHOOK_URL:'https://n8n.example.invalid/old-send',N8N_WHATSAPP_TEMPLATE_CATALOG_URL:'https://n8n.example.invalid/catalog',N8N_WHATSAPP_TEMPLATE_SEND_URL:'https://n8n.example.invalid/dynamic',INTERNAL_API_TOKEN:'SYNTHETIC',WHATSAPP_DYNAMIC_TEMPLATES_ENABLED:'true'};
+const env={N8N_SEND_WEBHOOK_URL:'https://n8n.example.invalid/old-send',N8N_WHATSAPP_TEMPLATE_CATALOG_URL:'https://n8n.example.invalid/catalog',N8N_WHATSAPP_TEMPLATE_SEND_URL:'https://n8n.example.invalid/dynamic',INTERNAL_API_TOKEN:'SYNTHETIC',WHATSAPP_DYNAMIC_TEMPLATES_ENABLED:'true',WHATSAPP_DYNAMIC_TEMPLATES_TEST_MODE:'false'};
 const values={'components[0].text:1':'عربي 😀','components[0].text:2':'English'};
 const input=()=>({sessionId:'201234567890',templateId:'123',language:'ar',revision:templateRevision(t()),values});
 const service=(options={})=>createDynamicTemplates({env,catalog:{list:async()=>({templates:[t()]})},fetchImpl:async()=>{throw Error('NETWORK_FORBIDDEN');},...options});
