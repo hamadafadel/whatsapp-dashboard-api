@@ -4,6 +4,8 @@ const crypto = require('crypto');
 const {PgSendQueueStore, SendQueue, fault: sendQueueFault} = require('./send-queue');
 const {PgAndroidPushStore} = require('./android-push-store');
 const {createAndroidPushService,registerAndroidPushRoutes} = require('./android-push');
+const {registerTemplateCatalog,createTemplateCatalog} = require('./whatsapp-template-catalog');
+const {createDynamicTemplates,registerDynamicTemplates} = require('./whatsapp-template-send');
 const { Readable } = require('stream');
 
 const express = require('express');
@@ -3224,6 +3226,11 @@ app.post('/api/meta-purchase', requireAuth, requireConversationAccess(), async (
 
 // تيمبليتات الواتس المعتمدة (بره فترة الـ 24 ساعة). templateName/language لازم
 // تطابق بالظبط اسم التيمبليت المسجّل ومعتمد في WhatsApp Business Manager
+const whatsappTemplateCatalog=createTemplateCatalog();
+const dynamicWhatsappTemplates=createDynamicTemplates({catalog:whatsappTemplateCatalog});
+registerTemplateCatalog(app,{requireAuth,requireConversationRole,catalog:whatsappTemplateCatalog,dynamicEnabled:()=>dynamicWhatsappTemplates.enabled()});
+registerDynamicTemplates(app,{requireAuth,requireConversationAccess,service:dynamicWhatsappTemplates,accept:acceptDurableSend});
+
 const WHATSAPP_TEMPLATES = {
   followup: {
     label: 'متابعة',
@@ -3997,6 +4004,7 @@ const durableSendQueue = new SendQueue({
   dispatch:async row=>{
     const account=findDashboardAccountByUsername(row.owner_name);
     if(!account||!await canRequestAccessConversation({user:account},row.session_id))throw sendQueueFault('SEND_PERMISSION_REVOKED',403);
+    if(row.payload?.dynamicTemplate)return dynamicWhatsappTemplates.dispatch(row);
     if(row.kind==='saved')return sendSavedMediaToSession(row.payload.item,row.session_id,row.payload.agentName,row.payload.caption);
     if(row.kind==='media')return sendDashboardMediaToChannel({...row.payload,sessionId:row.session_id});
     const p={...row.payload,sessionId:row.session_id};
