@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apk add --no-cache ffmpeg
 
 COPY package*.json ./
-RUN npm install
+RUN npm ci --omit=dev
 
 COPY . .
 

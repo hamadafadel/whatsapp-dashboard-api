@@ -6,6 +6,8 @@ const {PgAndroidPushStore} = require('./android-push-store');
 const {createAndroidPushService,registerAndroidPushRoutes} = require('./android-push');
 const {registerTemplateCatalog,createTemplateCatalog} = require('./whatsapp-template-catalog');
 const {createDynamicTemplates,registerDynamicTemplates} = require('./whatsapp-template-send');
+const {Campaigns,registerCampaigns} = require('./whatsapp-campaigns');
+const {StatusInbox}=require('./whatsapp-template-status-inbox');
 const { Readable } = require('stream');
 
 const express = require('express');
@@ -207,6 +209,9 @@ app.use((req,res,next)=>{
   }
   next();
 });
+// Only the new admin campaign routes need larger recipient snapshots.
+// Leave the limits/raw-body behavior of every existing route unchanged.
+app.use('/api/whatsapp/campaigns', requireAuth, requireAdmin, express.json({limit:'8mb'}));
 const parseDashboardJson = express.json({
   verify(req, res, buffer) {
     req.rawBody = Buffer.from(buffer);
@@ -1240,6 +1245,7 @@ app.get('/api/conversations', requireAuth, async (req, res) => {
           message->>'channel' AS channel,
           id
         FROM chat_memory
+        WHERE NOT (COALESCE(message->>'type','')='agent' AND COALESCE(message->>'campaign_bulk','false')='true')
         ORDER BY session_id, id DESC
       ),
       names AS (
@@ -4004,7 +4010,10 @@ const durableSendQueue = new SendQueue({
   dispatch:async row=>{
     const account=findDashboardAccountByUsername(row.owner_name);
     if(!account||!await canRequestAccessConversation({user:account},row.session_id))throw sendQueueFault('SEND_PERMISSION_REVOKED',403);
-    if(row.payload?.dynamicTemplate)return dynamicWhatsappTemplates.dispatch(row);
+    if(row.payload?.dynamicTemplate){
+      await whatsappCampaigns.beforeDispatch(row);
+      return dynamicWhatsappTemplates.dispatch(row);
+    }
     if(row.kind==='saved')return sendSavedMediaToSession(row.payload.item,row.session_id,row.payload.agentName,row.payload.caption);
     if(row.kind==='media')return sendDashboardMediaToChannel({...row.payload,sessionId:row.session_id});
     const p={...row.payload,sessionId:row.session_id};
@@ -4028,6 +4037,11 @@ async function acceptDurableSend(req,res,items,identity){
     return res.status(error.status||503).json({error:error.definitive?error.code:'SEND_QUEUE_UNAVAILABLE'});
   }
 }
+const whatsappCampaigns=new Campaigns({pool,catalog:whatsappTemplateCatalog,dynamic:dynamicWhatsappTemplates,
+  queueStore:durableSendQueue.store,queue:durableSendQueue,account:findDashboardAccountByUsername,
+  canAccess:(user,sid)=>canRequestAccessConversation({user},sid)});
+registerCampaigns(app,{service:whatsappCampaigns,requireAuth,requireAdmin,multer});
+const whatsappStatusInbox=new StatusInbox({pool});
 const sendMediaJobs = new Map();
 let sendMediaJobCounter = 0;
 
@@ -5524,6 +5538,8 @@ app.post('/api/gallery/items/:fileId/reorder', requireAuth, requireGallery, asyn
 const PORT = process.env.PORT || 3000;
 
 durableSendQueue.start();
+whatsappCampaigns.start();
+whatsappStatusInbox.start();
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });

@@ -39,11 +39,12 @@ async function fixture() {
     }
   };
   const app = { use() {}, listen() {} };
-  for (const method of ['get', 'post', 'put', 'delete']) {
+  for (const method of ['get', 'post', 'put', 'delete', 'options', 'patch']) {
     app[method] = (route, ...handlers) => routes.set(`${method.toUpperCase()} ${route}`, handlers);
   }
   const express = () => app;
   express.json = express.static = () => (req, res, next) => next();
+  express.Router = require('express').Router;
   const multer = () => ({ single: () => (req, res, next) => { calls.uploads++; next(); } });
   multer.diskStorage = multer.memoryStorage = () => ({});
   let lookupError = false;
@@ -77,7 +78,7 @@ async function fixture() {
   const mocks = {
     express, pg: { Pool: function () { return pool; } }, cors: () => () => {}, multer,
     jsonwebtoken: jwt, bcryptjs: {}, 'web-push': {},
-    fs: { existsSync: () => true, mkdirSync() {}, statSync: () => ({ size: 100 }),
+    fs: { promises:{readFile:async()=>Buffer.from('SYNTHETIC_UPLOAD_ONLY')},existsSync: () => true, mkdirSync() {}, statSync: () => ({ size: 100 }),
       unlink(p, cb) { cb?.(); }, unlinkSync() {}, readdirSync: () => [] },
     child_process: { execFile(command, args, callback) {
       calls.ffmpeg++; calls.ffmpegArgs.push({ command, args });
@@ -87,6 +88,9 @@ async function fixture() {
   };
   const context = {
     require(name) {
+      if(name==='./send-queue')return {...require('../send-queue'),PgSendQueueStore:require('./fixture-queue-store.cjs').FixtureQueueStore};
+      const localModules=['send-queue','android-push-store','android-push','whatsapp-template-catalog','whatsapp-template-send','whatsapp-campaigns','whatsapp-template-status-inbox','messenger-reply-preview'];
+      if(localModules.some(n=>name==='./'+n))return require('../'+name.slice(2));
       if (Object.hasOwn(mocks, name)) return mocks[name];
       if (['path', 'crypto', 'stream', 'util'].includes(name)) return require(name);
       throw new Error(`Unexpected dependency: ${name}`);
@@ -100,10 +104,12 @@ async function fixture() {
       return { ok: true, status: 200, json: async () => ({ success: true,
         message_id: 'TEST_FB_MID', messages: [{ id: 'TEST_WA_MID' }] }) };
     },
-    module: { exports: {} }, URL, Blob, FormData
+    module: { exports: {} }, URL, URLSearchParams, AbortSignal, Blob, FormData
   };
-  const source = fs.readFileSync(path.resolve(__dirname, '../server.js'), 'utf8');
-  vm.runInNewContext(source + '\nmodule.exports = { clients, broadcastDashboardEvent, sendMediaJobs, startSendMediaJob, getOrderConfirmationCanonicalPayload };', context);
+  const source = process.env.CATALOG_REVIEW_BASELINE === '1'
+    ? require('node:child_process').execFileSync('git',['show','HEAD:server.js'],{cwd:path.resolve(__dirname,'..'),encoding:'utf8'})
+    : fs.readFileSync(path.resolve(__dirname, '../server.js'), 'utf8');
+  vm.runInNewContext(source + '\nmodule.exports = { clients, broadcastDashboardEvent, sendMediaJobs, startSendMediaJob, getOrderConfirmationCanonicalPayload, durableSendQueue };', context);
   await new Promise(setImmediate);
   calls.sql.length = 0;
   const api = context.module.exports;
@@ -121,6 +127,8 @@ async function fixture() {
       file: options.file, rawBody: options.rawBody, get: () => 'api.example.invalid'
     });
     Object.assign(req.headers, options.headers || {});
+    req.headers['idempotency-key'] ||= crypto.randomUUID();
+    req.headers['x-send-queue-generation'] ??= String(await api.durableSendQueue.store.generation(req.body.sessionId));
     const res = {
       statusCode: 200, body: null, chunks: [], writableEnded: false, destroyed: false,
       status(code) { this.statusCode = code; return this; },
@@ -140,6 +148,7 @@ async function fixture() {
       if (next) await next;
     }
     await run(0);
+    if(res.statusCode===202)await api.durableSendQueue.run(req.body.sessionId);
     await new Promise(setImmediate);
     return { req, res };
   }
@@ -203,7 +212,7 @@ for (const channel of ['whatsapp', 'messenger']) {
       f.states.set(sessionId, { confirmation: true, hidden: role === 'admin', hiddenFor: role === 'admin' ? ['test_admin'] : [] });
       for (const [method, route, extra] of protectedRoutes.slice(0, 9)) {
         const { res } = await f.request(method, route, { role, params: { sessionId }, body: { sessionId, ...extra } });
-        assert.equal(res.statusCode, 200, `${method} ${route}`);
+        assert.equal(res.statusCode, route==='/api/send-message'&&!extra.messageKind?202:200, `${method} ${route}`);
       }
       const text = f.calls.fetch.find(c => JSON.parse(c.options.body).message === 'TEST TEXT');
       assert.equal(text.url, f.env[channel === 'messenger' ? 'N8N_FB_SEND_WEBHOOK_URL' : 'N8N_SEND_WEBHOOK_URL']);
@@ -325,13 +334,12 @@ test('saved-media single/batch/folder jobs retain session routing and protect st
   const sessionId = 'fb:TEST';
   for (const route of ['/api/saved-media-items/:id/send', '/api/saved-media-items/send-batch', '/api/saved-media-folders/:id/send']) {
     const created = await f.request('POST', route, { params: { id: '1' }, body: { sessionId, itemIds: [1], caption: 'TEST CAPTION' } });
-    assert.equal(created.res.statusCode, 200);
-    const jobId = created.res.body.jobId;
-    assert.equal(f.api.sendMediaJobs.get(jobId).sessionId, sessionId);
-    assert.equal((await f.request('GET', '/api/saved-media-send-jobs/:jobId', { params: { jobId } })).res.statusCode, 200);
-    assert.equal((await f.request('GET', '/api/saved-media-send-jobs/:jobId', { role: 'confirmation', params: { jobId } })).res.statusCode, 403);
-    assert.equal((await f.request('POST', '/api/saved-media-send-jobs/:jobId/cancel', { role: 'confirmation', params: { jobId } })).res.statusCode, 403);
-    assert.equal((await f.request('POST', '/api/saved-media-send-jobs/:jobId/cancel', { params: { jobId } })).res.statusCode, 200);
+    assert.equal(created.res.statusCode, 202);
+    const params={sessionId};
+    assert.equal((await f.request('GET', '/api/send-queue/:sessionId', {params})).res.statusCode, 200);
+    assert.equal((await f.request('GET', '/api/send-queue/:sessionId', { role:'confirmation',params})).res.statusCode,403);
+    assert.equal((await f.request('POST', '/api/send-queue/:sessionId/cancel', { role:'confirmation',params})).res.statusCode,403);
+    assert.equal((await f.request('POST', '/api/send-queue/:sessionId/cancel', {params})).res.statusCode,200);
   }
   for (const call of f.calls.fetch) {
     assert.equal(call.url, f.env.N8N_FB_SEND_WEBHOOK_URL);
@@ -360,7 +368,7 @@ for (const channel of ['whatsapp', 'messenger']) {
         const { res } = await f.request('POST', '/api/send-media', { role,
           body: { sessionId, messageKind, caption: 'TEST CAPTION', isVoiceRecording: 'true' },
           file: { path: '/synthetic/test.bin', filename: 'test.bin', mimetype: 'application/octet-stream', size: 100 } });
-        assert.equal(res.statusCode, 200, `${role} ${messageKind}`);
+        assert.equal(res.statusCode, 202, `${role} ${messageKind}: ${JSON.stringify(res.body)}`);
         assert.equal(f.calls.fetch.length, before + 1);
         const sent = f.calls.fetch.at(-1);
         assert.equal(sent.url, f.env[channel === 'messenger' ? 'N8N_FB_SEND_WEBHOOK_URL' : 'N8N_SEND_WEBHOOK_URL']);
@@ -506,17 +514,17 @@ for (const channel of ['whatsapp', 'messenger']) {
         const result = await f.request('POST', '/api/saved-media-items/:id/send', {
           role, params: { id: String(item.id) }, body: { sessionId, caption: 'TEST CAPTION' }
         });
-        assert.equal(result.res.statusCode, 200);
-        const job = f.api.sendMediaJobs.get(result.res.body.jobId);
-        assert.equal(job.sent, 1); assert.equal(job.failed, 0); assert.equal(job.done, true);
+        assert.equal(result.res.statusCode, 202);
+        const job = (await f.api.durableSendQueue.store.snapshot(sessionId)).find(r=>r.id===result.res.body.jobId);
+        assert.equal(job.state,'sent');assert.equal(job.session_id,sessionId);
         assert.equal(JSON.parse(f.calls.fetch.at(-1).options.body).messageKind, item.media_kind);
       }
       for (const route of ['/api/saved-media-items/send-batch', '/api/saved-media-folders/:id/send']) {
         const result = await f.request('POST', route, { role, params: { id: '1' },
           body: { sessionId, itemIds: items.map(item => item.id) } });
-        assert.equal(result.res.statusCode, 200);
-        const job = f.api.sendMediaJobs.get(result.res.body.jobId);
-        assert.equal(job.sent, 4); assert.equal(job.failed, 0); assert.equal(job.done, true);
+        assert.equal(result.res.statusCode, 202);
+        const rows=await f.api.durableSendQueue.store.snapshot(sessionId);
+        assert.equal(rows.slice(-4).filter(r=>r.state==='sent').length,4);
       }
       assert.equal(f.calls.fetch.length, 12);
       for (const call of f.calls.fetch) {

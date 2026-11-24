@@ -1,0 +1,35 @@
+'use strict';
+const {test}=require('node:test'),assert=require('node:assert/strict');
+const {phone,csv,parseFile,guardZip}=require('../whatsapp-campaign-import');
+const {mergeRows,consentReason,Campaigns,registerCampaigns}=require('../whatsapp-campaigns');
+const express=require('express'),multer=require('multer');
+for(const value of ['+1 (202) 555-0101','0012025550101','12025550101','١٢٠٢٥٥٥٠١٠١'])test('normalize international '+value,()=>assert.equal(phone(value),'12025550101'));
+test('local number requires explicit country',()=>{assert.throws(()=>phone('02079460000'));assert.equal(phone('02079460000','GB'),'442079460000');});
+for(const value of ['fb:12025550101','ig:12025550101','EG.identity','123','call +12025550101','12025550101 ext 3'])test('reject non-phone '+value,()=>assert.throws(()=>phone(value)));
+test('CSV quoting, BOM, Arabic and multiline cells',()=>assert.deepEqual(csv('\uFEFFname,phone,note\r\n"عربي، English 😀",+12025550101,"one\nline"\r\n'),[['name','phone','note'],['عربي، English 😀','+12025550101','one\nline']]));
+test('CSV detects unmatched quotation',()=>assert.throws(()=>csv('a,b\n"broken'),/INVALID_CSV/));
+test('CSV headers and formula cells are rejected',async()=>{for(const text of ['a,a\n1,2','__proto__,phone\nx,1','name,phone\n=cmd,1'])await assert.rejects(parseFile(Buffer.from(text),'test.csv'));});
+test('import accepts CSV and never trusts consent columns',async()=>{const x=await parseFile(Buffer.from('phone,consent\n+12025550101,yes'),'test.csv');assert.equal(x.total,1);assert.equal(x.rows[0].consent,'yes');assert.equal(consentReason(null,'UTILITY'),'CONSENT_REQUIRED');});
+test('real XLSX archive parses original Unicode and numeric phone, no macros or network',async()=>{
+ const {zipSync,strToU8}=require('fflate');const files={
+  '[Content_Types].xml':'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>',
+  '_rels/.rels':'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
+  'xl/workbook.xml':'<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Contacts" sheetId="1" r:id="rId1"/></sheets></workbook>',
+  'xl/_rels/workbook.xml.rels':'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>',
+  'xl/worksheets/sheet1.xml':'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>phone</t></is></c><c r="B1" t="inlineStr"><is><t>name</t></is></c></row><row r="2"><c r="A2"><v>12025550101</v></c><c r="B2" t="inlineStr"><is><t>عربي English 😀</t></is></c></row></sheetData></worksheet>'};
+ const bytes=Buffer.from(zipSync(Object.fromEntries(Object.entries(files).map(([k,v])=>[k,strToU8(v)]))));const result=await parseFile(bytes,'synthetic.xlsx');assert.equal(result.rows[0].phone,'12025550101');assert.equal(result.rows[0].name,'عربي English 😀');
+ const macro=Buffer.from(zipSync({...Object.fromEntries(Object.entries(files).map(([k,v])=>[k,strToU8(v)])),'xl/vbaProject.bin':strToU8('blocked')}));await assert.rejects(parseFile(macro,'synthetic.xlsx'),/IMPORT_ACTIVE_CONTENT/);
+});
+test('reject unsupported XLS, large files and malformed zip',async()=>{await assert.rejects(parseFile(Buffer.from('x'),'test.xls'));await assert.rejects(parseFile(Buffer.alloc(2*1024*1024+1),'x.csv'));assert.throws(()=>guardZip(Buffer.alloc(22)));});
+test('merge Labels + manual + Excel by normalized number, not name',()=>{const r=mergeRows([{phone:'+12025550101',name:'أ',sources:['Label A'],values:{a:'1'}},{phone:'12025550101',sources:['Excel'],values:{a:'1'}},{phone:'+12025550102',name:'أ',values:{a:'1'}}]);assert.equal(r.length,2);assert.deepEqual(r[0].sources,['Label A','Excel']);});
+test('duplicate variable conflict rejects entire prepare',()=>assert.throws(()=>mergeRows([{phone:'12025550101',values:{x:'a'}},{phone:'12025550101',values:{x:'b'}}]),/CONFLICT/));
+test('withdrawal and category mismatch exclude; Labels never grant consent',()=>{assert.equal(consentReason({status:'withdrawn',categories:['UTILITY']},'UTILITY'),'OPTED_OUT');assert.equal(consentReason({status:'granted',categories:['UTILITY']},'MARKETING'),'CONSENT_REQUIRED');assert.equal(consentReason({status:'granted',categories:['UTILITY']},'UTILITY'),null);});
+test('campaign scheduler cannot start accidentally; old individual row bypasses new guard',async()=>{let connections=0;const s=new Campaigns({pool:{connect(){connections++;throw Error();}},env:{}});s.start();await s.tick();await s.beforeDispatch({payload:{dynamicTemplate:{}}});assert.equal(connections,0);assert.equal(s.timer,null);});
+test('admin status is refreshed from trusted account, not stale JWT or supplied role',async()=>{const s=new Campaigns({account:()=>({username:'former-admin',role:'agent'})});await assert.rejects(s.admin({username:'former-admin',role:'admin'}),/ADMINS_ONLY/);});
+test('connection error releases local busy guard',async()=>{const s=new Campaigns({pool:{connect:async()=>{throw Error('DB_DOWN');}},dynamic:{enabled:()=>true},env:{WHATSAPP_CAMPAIGNS_ENABLED:'true',WHATSAPP_CAMPAIGNS_WORKER_ENABLED:'true'}});await assert.rejects(s.tick());assert.equal(s.busy,false);});
+test('router rejects unauthenticated/agent callers and internal status without correct key',async()=>{
+ const app=express();app.use(express.json());const service=new Campaigns({pool:{query:async()=>({rows:[]})},account:()=>({role:'admin'}),env:{}});
+ registerCampaigns(app,{service,multer,env:{INTERNAL_API_TOKEN:'synthetic-key'},requireAuth:(req,res,next)=>req.headers.authorization?next():res.sendStatus(401),requireAdmin:(req,res,next)=>req.headers.authorization==='admin'?next():res.sendStatus(403)});
+ const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.on('listening',r));const url='http://127.0.0.1:'+server.address().port;
+ try{for(const path of ['', '/conversation-groups','/conversation-list?filter=replied']){assert.equal((await fetch(url+'/api/whatsapp/campaigns'+path)).status,401);assert.equal((await fetch(url+'/api/whatsapp/campaigns'+path,{headers:{Authorization:'agent'}})).status,403);}assert.equal((await fetch(url+'/api/whatsapp/campaigns',{headers:{Authorization:'admin'}})).status,403);assert.equal((await fetch(url+'/api/internal/whatsapp/template-status',{method:'POST',headers:{'x-api-key':'bad'}})).status,401);}finally{await new Promise(r=>server.close(r));}
+});
