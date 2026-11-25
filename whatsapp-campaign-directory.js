@@ -8,10 +8,11 @@ async function directory(pool,{labels=[],all=false,q='',offset=0,limit=50,identi
  LEFT JOIN LATERAL (SELECT array_agg(label_id ORDER BY label_id) AS label_ids FROM public.conversation_label_assignments WHERE session_id=i.session_id) a ON true
  LEFT JOIN LATERAL (SELECT message->>'customer_name' AS name FROM public.chat_memory WHERE session_id=i.session_id AND COALESCE(message->>'customer_name','')<>'' ORDER BY id DESC LIMIT 1) n ON true
  WHERE ($1::boolean OR COALESCE(a.label_ids,'{}'::int[]) && $2::int[]) AND NOT(i.session_id=ANY($4::text[]))
- ), matches AS (SELECT * FROM contacts WHERE $3='' OR position(lower($3) IN lower(name))>0 OR position($3 IN phone)>0)`;
+ ), matches AS (SELECT * FROM contacts WHERE $3='' OR position(lower($3) IN lower(name))>0 OR position($7 IN phone)>0)`;
  const args=[all,[...new Set(labels)],q.trim(),exclude];
  // A single statement gives an exact count even on an empty/out-of-range page.
- const result=await pool.query(cte+` SELECT (SELECT count(*)::int FROM matches) AS total,COALESCE((SELECT jsonb_agg(x) FROM (SELECT ${identitiesOnly?'phone,label_ids':'phone,name,label_ids'} FROM matches ORDER BY phone LIMIT $5 OFFSET $6) x),'[]'::jsonb) AS rows`,[...args,identitiesOnly?10001:limit,identitiesOnly?0:offset]);
+ const phoneSearch=/\d/.test(q)&&/^\+?[\d\s().-]+$/.test(q.trim())?q.replace(/\D/g,''):q.trim();
+ const result=await pool.query(cte+` SELECT (SELECT count(*)::int FROM matches) AS total,COALESCE((SELECT jsonb_agg(x) FROM (SELECT ${identitiesOnly?'phone,label_ids':'phone,name,label_ids'} FROM matches ORDER BY phone LIMIT $5 OFFSET $6) x),'[]'::jsonb) AS rows`,[...args,identitiesOnly?10001:limit,identitiesOnly?0:offset,phoneSearch]);
  const data=result.rows[0];if(identitiesOnly&&data.total>10000)throw fault('RECIPIENT_LIMIT',422);
  if(identitiesOnly)return {rows:data.rows,total:data.total,identitiesOnly:true};
  const phones=data.rows.map(r=>r.phone),perms=await pool.query('SELECT phone,status,categories FROM public.whatsapp_contact_permissions WHERE phone=ANY($1::text[])',[phones]);

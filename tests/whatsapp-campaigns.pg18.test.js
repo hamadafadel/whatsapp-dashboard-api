@@ -54,6 +54,8 @@ test('read-only directory pages, overlapping Labels, all/unlabelled search, IDs 
  const search=await directory(pool,{all:true,q:'بلا تصنيف'});assert.equal(search.total,1);assert.equal(search.rows[0].phone,'12025550125');assert.deepEqual(search.rows[0].label_ids,[]);
  assert.equal((await directory(pool,{labels:[1],q:'بلا تصنيف'})).total,0);
  assert.equal((await directory(pool,{all:true,q:'12025550125'})).total,1);
+ assert.equal((await directory(pool,{all:true,q:'+1 (202) 555-0125'})).total,1);
+ assert.equal((await directory(pool,{all:true,q:'-'})).total,0);
  assert.equal((await directory(pool,{all:true,q:"' OR 1=1 --"})).total,0);
  assert.equal((await directory(pool,{all:true,offset:1000})).total,125);
  const ids=await directory(pool,{all:true,identitiesOnly:true});assert.equal(ids.rows.length,125);assert(!('name' in ids.rows[0]));assert.deepEqual(ids.rows[0].label_ids,[1,2]);
