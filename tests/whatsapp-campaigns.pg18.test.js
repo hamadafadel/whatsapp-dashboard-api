@@ -22,12 +22,51 @@ before(async()=>{
  // Existing production indexes are part of the baseline, not a new campaign migration.
  await pool.query("CREATE INDEX idx_chat_memory_session_id_id_desc ON chat_memory(session_id,id DESC);CREATE INDEX idx_chat_memory_customer_name_session_id_desc ON chat_memory(session_id,id DESC) WHERE COALESCE(message->>'customer_name','')<>'';CREATE INDEX idx_chat_memory_user_session_id_desc ON chat_memory(session_id,id DESC) WHERE message->>'type'='user';");
  await pool.query(fs.readFileSync(path.join(__dirname,'../whatsapp_campaigns.sql'),'utf8'));store=new PgSendQueueStore(pool);
- service=new Campaigns({pool,catalog:{list:async()=>({templates:[t]})},dynamic:{enabled:()=>true},queueStore:store,account:n=>n===admin.username?admin:null,canAccess:async(u,s)=>u?.role==='admin',env:{WHATSAPP_CAMPAIGNS_ENABLED:'true',WHATSAPP_CAMPAIGNS_WORKER_ENABLED:'true',WHATSAPP_PHONE_NUMBER_ID:'12345'}});
+ service=new Campaigns({pool,catalog:{list:async()=>({templates:[t]})},dynamic:{enabled:()=>true},queueStore:store,account:n=>n===admin.username?admin:null,canAccess:async(u,s)=>u?.role==='admin',env:{WHATSAPP_CAMPAIGNS_TEST_MODE:'false',WHATSAPP_CAMPAIGNS_ENABLED:'true',WHATSAPP_CAMPAIGNS_WORKER_ENABLED:'true',WHATSAPP_PHONE_NUMBER_ID:'12345'}});
 });
 beforeEach(async()=>{await pool.query('TRUNCATE whatsapp_template_campaign_recipients,whatsapp_template_campaigns,whatsapp_contact_permissions,whatsapp_contact_permission_audit,whatsapp_template_delivery_events,whatsapp_template_status_inbox,dashboard_send_queue,dashboard_send_queue_sessions,conversation_label_assignments,conversation_labels,chat_memory,chat_sessions CASCADE');});
 after(async()=>{await pool?.end();if(child)spawnSync(path.join(bin,'pg_ctl.exe'),['-D',path.join(root,'data'),'stop','-m','fast','-w'],{windowsHide:true});});
 const grant=async(n='12025550101')=>service.consent(admin,{phone:n,status:'granted',categories:['UTILITY'],evidence:'Synthetic explicit permission'});
+test('limited test: concurrent API preparations admit one campaign only; stable retry reuses it',async()=>{
+ const limited=new Campaigns({...service,env:{...service.env,WHATSAPP_CAMPAIGNS_TEST_MODE:undefined}});await grant('201114438440');
+ await assert.rejects(limited.prepare(admin,body(),randomUUID()),/CAMPAIGN_TEST_RECIPIENT_ONLY/);
+ await assert.rejects(limited.prepare(admin,body([row('201114438440'),row()]),randomUUID()),/CAMPAIGN_TEST_RECIPIENT_ONLY/);
+ const keys=[randomUUID(),randomUUID()],attempts=await Promise.allSettled(keys.map(key=>limited.prepare(admin,body([row('201114438440')]),key)));
+ assert.equal(attempts.filter(x=>x.status==='fulfilled').length,1);assert.match(attempts.find(x=>x.status==='rejected').reason.message,/CAMPAIGN_TEST_SINGLE_OPERATION_ONLY/);
+ const index=attempts.findIndex(x=>x.status==='fulfilled'),saved=attempts[index].value,retry=await limited.prepare(admin,body([row('201114438440')]),keys[index]);assert.equal(saved.campaign.id,retry.campaign.id);
+ await limited.control(admin,saved.campaign.id,'confirm',saved.reviewToken);await limited.tick();const queued=(await pool.query('SELECT * FROM dashboard_send_queue')).rows;assert.equal(queued.length,1);await limited.beforeDispatch(queued[0]);
+ await limited.tick();assert.equal((await pool.query('SELECT count(*)::int AS n FROM dashboard_send_queue')).rows[0].n,1);
+ const changed=structuredClone(queued[0]);changed.session_id='12025550101';await assert.rejects(limited.beforeDispatch(changed),/CAMPAIGN_TEST_RECIPIENT_ONLY/);
+ limited.env.WHATSAPP_CAMPAIGNS_WORKER_ENABLED='false';await assert.rejects(limited.beforeDispatch(queued[0]),/CAMPAIGN_SENDING_DISABLED/);
+});
+test('limited test: pre-existing foreign campaign cannot bypass through Scheduler or confirmation',async()=>{
+ await grant();const saved=await service.prepare(admin,body(),randomUUID());await service.control(admin,saved.campaign.id,'confirm',saved.reviewToken);
+ const limited=new Campaigns({...service,env:{...service.env,WHATSAPP_CAMPAIGNS_TEST_MODE:undefined}});
+ await assert.rejects(limited.tick(),/CAMPAIGN_TEST_RECIPIENT_ONLY/);await assert.rejects(limited.control(admin,saved.campaign.id,'resume',saved.reviewToken),/CAMPAIGN_TEST_RECIPIENT_ONLY/);
+ assert.equal((await pool.query('SELECT count(*)::int AS n FROM dashboard_send_queue')).rows[0].n,0);
+});
 require('./campaign-conversation.pg18.scenarios.cjs')({getPool:()=>pool,getService:()=>service,grant,body,row,admin});
+test('read-only directory pages, overlapping Labels, all/unlabelled search, IDs snapshot and database names',async()=>{
+ const {directory}=require('../whatsapp-campaign-directory');
+ await pool.query("INSERT INTO conversation_labels(id,name) VALUES(1,'أول'),(2,'ثان'); INSERT INTO chat_sessions(session_id) SELECT '1202555'||lpad(i::text,4,'0') FROM generate_series(1,125) i; INSERT INTO chat_memory(session_id,message) SELECT session_id,jsonb_build_object('customer_name',CASE WHEN session_id='12025550125' THEN 'عميل بلا تصنيف بعيد' ELSE 'عميل '||session_id END) FROM chat_sessions; INSERT INTO conversation_label_assignments SELECT session_id,1 FROM chat_sessions WHERE session_id<>'12025550125'; INSERT INTO conversation_label_assignments SELECT session_id,2 FROM chat_sessions WHERE session_id<='12025550060';");
+ const first=await directory(pool,{labels:[1,2]});assert.equal(first.total,124);assert.equal(first.rows.length,50);assert.equal(new Set(first.rows.map(r=>r.phone)).size,50);
+ const second=await directory(pool,{labels:[1,2],offset:50});assert.equal(second.rows.length,50);assert(!first.rows.some(a=>second.rows.some(b=>a.phone===b.phone)));
+ const search=await directory(pool,{all:true,q:'بلا تصنيف'});assert.equal(search.total,1);assert.equal(search.rows[0].phone,'12025550125');assert.deepEqual(search.rows[0].label_ids,[]);
+ assert.equal((await directory(pool,{labels:[1],q:'بلا تصنيف'})).total,0);
+ assert.equal((await directory(pool,{all:true,q:'12025550125'})).total,1);
+ assert.equal((await directory(pool,{all:true,q:"' OR 1=1 --"})).total,0);
+ assert.equal((await directory(pool,{all:true,offset:1000})).total,125);
+ const ids=await directory(pool,{all:true,identitiesOnly:true});assert.equal(ids.rows.length,125);assert(!('name' in ids.rows[0]));assert.deepEqual(ids.rows[0].label_ids,[1,2]);
+ assert.equal((await directory(pool,{all:true,exclude:['12025550125']})).total,124);
+ const result=await service.resolve([{phone:'+12025550125',name:'Imported incorrect name'}]);assert.equal(result.rows[0].name,'عميل بلا تصنيف بعيد');
+ assert.equal((await pool.query('SELECT count(*)::int n FROM whatsapp_template_campaigns')).rows[0].n,0);
+});
+test('directory enforces bounded queries and explicit bulk limit',async()=>{
+ const {directory}=require('../whatsapp-campaign-directory');
+ for(const b of [{},{all:'true'},{all:true,limit:201},{labels:['1']},{all:true,q:'x'.repeat(121)},{all:true,offset:-1}])await assert.rejects(directory(pool,b),/INVALID_DIRECTORY_QUERY/);
+ await pool.query("INSERT INTO chat_sessions(session_id) SELECT '1202'||lpad(i::text,8,'0') FROM generate_series(1,10001) i");
+ await assert.rejects(directory(pool,{all:true,identitiesOnly:true}),/RECIPIENT_LIMIT/);assert.equal((await directory(pool,{all:true})).rows.length,50);
+});
 test('migration fails safely on reapplication without losing any audit rows',async()=>{await grant();await assert.rejects(pool.query(fs.readFileSync(path.join(__dirname,'../whatsapp_campaigns.sql'),'utf8')));await pool.query('ROLLBACK');assert.equal((await pool.query('SELECT count(*)::int AS n FROM whatsapp_contact_permission_audit')).rows[0].n,1);});
 
 test('migration guards are evaluated before any new DDL and match production metadata',()=>{

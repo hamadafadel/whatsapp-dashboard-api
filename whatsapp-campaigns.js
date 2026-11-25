@@ -7,6 +7,7 @@ const {fault}=require('./send-queue');
 const {enrich,summarize,xlsxReport}=require('./whatsapp-campaign-report');
 const {CampaignConversations}=require('./whatsapp-campaign-conversations');
 const {historyPage}=require('./whatsapp-campaign-history');
+const directoryTools=require('./whatsapp-campaign-directory');
 const uuid=s=>typeof s==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
 const hash=x=>createHash('sha256').update(JSON.stringify(x)).digest('hex');
 function mergeRows(input,country){
@@ -32,14 +33,22 @@ function consentReason(record,category){
 class Campaigns {
   constructor({pool,catalog,dynamic,queueStore,queue,account,canAccess,env=process.env}){Object.assign(this,{pool,catalog,dynamic,queueStore,queue,account,canAccess,env});this.timer=null;this.busy=false;}
   enabled(){return this.env.WHATSAPP_CAMPAIGNS_ENABLED==='true';}
+  testLimited(){return this.env.WHATSAPP_CAMPAIGNS_TEST_MODE!=='false';}
+  testRecipients(rows){if(this.testLimited()&&(!Array.isArray(rows)||rows.length!==1||rows[0].phone!=='201114438440'))throw fault('CAMPAIGN_TEST_RECIPIENT_ONLY',403);}
+  async testCampaign(c,id){
+    if(!this.testLimited())return;
+    const campaigns=(await c.query('SELECT id FROM public.whatsapp_template_campaigns ORDER BY created_at,id LIMIT 2')).rows;
+    if(campaigns.length!==1||campaigns[0].id!==id)throw fault('CAMPAIGN_TEST_SINGLE_OPERATION_ONLY',403);
+    this.testRecipients((await c.query('SELECT phone FROM public.whatsapp_template_campaign_recipients WHERE campaign_id=$1',[id])).rows);
+  }
   async ready(){await this.pool.query('SELECT id FROM public.whatsapp_template_campaigns LIMIT 0');}
   async admin(user){const actual=user?.username&&this.account(user.username);if(!actual||actual.role!=='admin')throw fault('ADMINS_ONLY',403);return actual;}
   async permissions(numbers){return new Map((await this.pool.query('SELECT phone,status,categories FROM public.whatsapp_contact_permissions WHERE phone=ANY($1::text[])',[numbers])).rows.map(r=>[r.phone,r]));}
   async resolve(rows,country){
     if(!Array.isArray(rows)||rows.length>10000)throw fault('RECIPIENT_LIMIT',422);
     const normalized=rows.map((r,i)=>{try{return {...r,phone:phone(r.phone,country),inputIndex:i};}catch{return {...r,phone:'',inputIndex:i,reason:'INVALID_WHATSAPP_NUMBER'};}});
-    const perms=await this.permissions(normalized.map(r=>r.phone).filter(Boolean));
-    return {rows:normalized.map(r=>({phone:r.phone,name:String(r.name||'').slice(0,160),inputIndex:r.inputIndex,reason:r.reason||null,permission:perms.get(r.phone)||null}))};
+    const phones=normalized.map(r=>r.phone).filter(Boolean),perms=await this.permissions(phones),names=await directoryTools.names(this.pool,phones);
+    return {rows:normalized.map(r=>({phone:r.phone,name:names.get(r.phone)||String(r.name||'').slice(0,160),inputIndex:r.inputIndex,reason:r.reason||null,permission:perms.get(r.phone)||null}))};
   }
   async labels(ids,q='',offset=0,limit=100){
     if(!Array.isArray(ids)||!ids.length||ids.length>100||ids.some(x=>!Number.isSafeInteger(x)||x<1))throw fault('INVALID_LABELS',422);
@@ -79,6 +88,7 @@ class Campaigns {
     return t;
   }
   async prepare(user,b,requestId){
+    const testRows=mergeRows(b.recipients,b.country);this.testRecipients(testRows);
     if(!uuid(requestId)||typeof b.title!=='string'||!b.title.trim()||b.title.length>120)throw fault('CAMPAIGN_TITLE_AND_KEY_REQUIRED',422);
     if(!Array.isArray(b.excludePhones||[]))throw fault('INVALID_EXCLUSIONS',422);
     const t=await this.definition(b),rows=mergeRows(b.recipients,b.country),perms=await this.permissions(rows.map(r=>r.phone)),excluded=new Set(b.excludePhones||[]);
@@ -91,6 +101,11 @@ class Campaigns {
     const fingerprint=hash({title:b.title.trim(),templateId:t.id,language:t.language,revision:b.revision,interval,excludePhones:[...excluded].sort(),rows:rows.map(({eligible,reason,...r})=>r)});
     const c=await this.pool.connect();try{
       await c.query('BEGIN');await c.query("SELECT pg_advisory_xact_lock(hashtextextended('wa-campaign:'||$1||':'||$2,0))",[user.username,requestId]);
+      if(this.testLimited()){
+        await c.query("SELECT pg_advisory_xact_lock(hashtextextended('wa-campaign-single-test-v1',0))");
+        const existing=(await c.query('SELECT owner_name,request_id FROM public.whatsapp_template_campaigns LIMIT 1')).rows[0];
+        if(existing&&(existing.owner_name!==user.username||existing.request_id!==requestId))throw fault('CAMPAIGN_TEST_SINGLE_OPERATION_ONLY',403);
+      }
       const old=(await c.query('SELECT id,fingerprint FROM public.whatsapp_template_campaigns WHERE owner_name=$1 AND request_id=$2',[user.username,requestId])).rows[0];
       if(old){if(old.fingerprint!==fingerprint)throw fault('IDEMPOTENCY_CONFLICT',409);await c.query('COMMIT');return this.detail(old.id);}
       const id=randomUUID();await c.query('INSERT INTO public.whatsapp_template_campaigns(id,owner_name,request_id,fingerprint,title,template,revision,interval_ms,is_bulk) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)',[id,user.username,requestId,fingerprint,b.title.trim(),t,b.revision,interval,rows.length>1]);
@@ -127,6 +142,7 @@ class Campaigns {
     }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
   }
   async control(user,id,action,token){
+    if(action==='confirm'||action==='resume')await this.testCampaign(this.pool,id);
     const d=await this.detail(id);if(action==='confirm'){
       if(d.campaign.state!=='draft'){if(d.campaign.confirmed_at&&d.reviewToken===token&&d.campaign.state!=='cancelled')return d;throw fault('CAMPAIGN_NOT_DRAFT',409);}
       if(token!==d.reviewToken||!d.eligible)throw fault('REVIEW_REQUIRED_OR_NO_ELIGIBLE_RECIPIENTS',409);
@@ -180,10 +196,12 @@ class Campaigns {
     if(!row.payload?.campaignRecipientId)return;
     if(!uuid(row.payload.campaignRecipientId))throw fault('INVALID_CAMPAIGN_ENVELOPE',403);
     if(!this.enabled()||this.env.WHATSAPP_CAMPAIGNS_WORKER_ENABLED!=='true')throw fault('CAMPAIGN_SENDING_DISABLED');
-    const r=(await this.pool.query(`SELECT r.phone,r.queue_request_id,r.values,c.owner_name,c.template,c.revision,p.status,p.categories FROM public.whatsapp_template_campaign_recipients r
+    this.testRecipients([{phone:row.session_id}]);
+    const r=(await this.pool.query(`SELECT r.phone,r.campaign_id,r.queue_request_id,r.values,c.owner_name,c.template,c.revision,p.status,p.categories FROM public.whatsapp_template_campaign_recipients r
       JOIN public.whatsapp_template_campaigns c ON c.id=r.campaign_id LEFT JOIN public.whatsapp_contact_permissions p ON p.phone=r.phone WHERE r.id=$1`,[row.payload.campaignRecipientId])).rows[0];
     const input=row.payload.dynamicTemplate,ordered=v=>Object.entries(v||{}).sort(([a],[b])=>a.localeCompare(b));
     if(!r||r.phone!==row.session_id||r.queue_request_id!==row.request_id||r.owner_name!==row.owner_name||r.template.id!==input?.templateId||r.template.language!==input.language||r.revision!==input.revision||hash(ordered(r.values))!==hash(ordered(input.values)))throw fault('INVALID_CAMPAIGN_ENVELOPE',403);
+    await this.testCampaign(this.pool,r.campaign_id);
     const a=this.account(row.owner_name);if(a?.role!=='admin'||!await this.canAccess(a,r.phone))throw fault('SEND_PERMISSION_REVOKED',403);
     const reason=consentReason(r,r.template.category);if(reason)throw fault(reason,403);
   }
@@ -204,6 +222,7 @@ class Campaigns {
       const r=(await c.query(`SELECT r.*,c.owner_name,c.template,c.revision,c.interval_ms FROM public.whatsapp_template_campaign_recipients r
         JOIN public.whatsapp_template_campaigns c ON c.id=r.campaign_id WHERE c.state='running' AND c.next_at<=now() AND r.state='pending'
         ORDER BY c.created_at,r.phone LIMIT 1`)).rows[0];if(!r)return;
+      await this.testCampaign(c,r.campaign_id);this.testRecipients([r]);
       const pacing=(await c.query(`SELECT q.created_at+greatest($1::int,c.interval_ms)*interval '1 millisecond'>now() AS wait
         FROM public.dashboard_send_queue q JOIN public.whatsapp_template_campaign_recipients r ON r.queue_request_id::text=q.request_id
         JOIN public.whatsapp_template_campaigns c ON c.id=r.campaign_id
@@ -237,6 +256,7 @@ function registerCampaigns(app,{service,requireAuth,requireAdmin,multer,env=proc
   const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:2*1024*1024,files:1,fields:0}}).single('file');
   router.post('/import',(req,res,next)=>upload(req,res,e=>e?res.status(422).json({error:'IMPORT_SIZE_OR_FORMAT_LIMIT'}):next()),run(req=>{if(!req.file)throw fault('FILE_REQUIRED',422);return parseFile(req.file.buffer,req.file.originalname);}));
   router.post('/resolve',run(req=>service.resolve(req.body.rows,req.body.country)));
+  router.post('/recipient-directory',run(req=>directoryTools.directory(service.pool,req.body)));
   router.get('/label-recipients',run(req=>service.labels(String(req.query.labels||'').split(',').map(Number),req.query.q||'',Number(req.query.offset||0),Number(req.query.limit||100))));
   const conversations=new CampaignConversations(service);
   router.get('/conversation-groups',run(req=>conversations.groups(req.query.q||'',Number(req.query.offset||0))));
