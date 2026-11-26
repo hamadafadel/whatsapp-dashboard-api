@@ -80,6 +80,26 @@ class Campaigns {
       await c.query('COMMIT');return {saved:true};
     }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
   }
+  async bulkConsent(user,b){
+    const actual=await this.admin(user);
+    if(!Array.isArray(b.phones)||!b.phones.length||b.phones.length>10000)throw fault('RECIPIENT_LIMIT',422);
+    const numbers=[...new Set(b.phones.map(n=>phone(n)))].sort(),categories=b.categories;
+    if(!['granted','withdrawn'].includes(b.status)||!Array.isArray(categories)||!categories.length||categories.some(c=>!['MARKETING','UTILITY','AUTHENTICATION'].includes(c))||typeof b.evidence!=='string'||b.evidence.trim().length<5||b.evidence.length>1000)throw fault('CONSENT_EVIDENCE_REQUIRED',422);
+    for(const n of numbers)if(!await this.canAccess(actual,n))throw fault('RECIPIENT_ACCESS_DENIED',403);
+    const c=await this.pool.connect();try{
+      await c.query('BEGIN');
+      // Conflict-row locking also protects a concurrent withdrawal. Bulk grants never revoke an opt-out.
+      const changed=(await c.query(`INSERT INTO public.whatsapp_contact_permissions(phone,status,categories,evidence,recorded_by)
+        SELECT n,$2,$3,$4,$5 FROM unnest($1::text[]) n ORDER BY n
+        ON CONFLICT(phone) DO UPDATE SET status=EXCLUDED.status,categories=EXCLUDED.categories,evidence=EXCLUDED.evidence,recorded_by=EXCLUDED.recorded_by,updated_at=now()
+        WHERE EXCLUDED.status='withdrawn' OR whatsapp_contact_permissions.status<>'withdrawn'
+        RETURNING phone,status,categories`,[numbers,b.status,[...new Set(categories)],b.evidence.trim(),actual.username])).rows;
+      await c.query(`INSERT INTO public.whatsapp_contact_permission_audit(phone,status,categories,evidence,recorded_by)
+        SELECT phone,status,categories,evidence,recorded_by FROM public.whatsapp_contact_permissions WHERE phone=ANY($1::text[]) ORDER BY phone`,[changed.map(r=>r.phone)]);
+      const permissions=(await c.query('SELECT phone,status,categories FROM public.whatsapp_contact_permissions WHERE phone=ANY($1::text[])',[numbers])).rows;
+      await c.query('COMMIT');return {saved:true,total:numbers.length,updated:changed.length,skippedWithdrawn:numbers.length-changed.length,permissions};
+    }catch(e){await c.query('ROLLBACK');throw e;}finally{c.release();}
+  }
   async definition(b){
     const data=await this.catalog.list({fresh:true}),t=data.templates.find(t=>t.id===b.templateId&&t.language===b.language);
     if(!t||t.status!=='APPROVED')throw fault('TEMPLATE_NO_LONGER_APPROVED',422);
@@ -263,6 +283,7 @@ function registerCampaigns(app,{service,requireAuth,requireAdmin,multer,env=proc
   router.get('/conversation-group/:id',run(req=>conversations.group(req.params.id)));
   router.get('/conversation-list',run(req=>conversations.list({campaign:req.query.campaign||'',filter:req.query.filter||'all',q:req.query.q||'',offset:Number(req.query.offset||0),limit:Number(req.query.limit||50)})));
   router.post('/permissions',run(req=>service.consent(req.user,req.body)));
+  router.post('/permissions/bulk',run(req=>service.bulkConsent(req.user,req.body)));
   router.get('/',run(req=>service.list(Number(req.query.offset||0))));
   router.post('/',run(req=>service.prepare(req.user,req.body,req.headers['idempotency-key'])));
   router.get('/:id/export',async(req,res)=>{try{const d=await service.detail(req.params.id);res.set('Content-Type','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');res.set('Content-Disposition',`attachment; filename="campaign-${d.campaign.id}.xlsx"`);res.send(xlsxReport(d));}catch(e){res.status(e.status||503).json({error:e.definitive?e.code:'EXPORT_UNAVAILABLE'});}});

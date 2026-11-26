@@ -27,6 +27,27 @@ before(async()=>{
 beforeEach(async()=>{await pool.query('TRUNCATE whatsapp_template_campaign_recipients,whatsapp_template_campaigns,whatsapp_contact_permissions,whatsapp_contact_permission_audit,whatsapp_template_delivery_events,whatsapp_template_status_inbox,dashboard_send_queue,dashboard_send_queue_sessions,conversation_label_assignments,conversation_labels,chat_memory,chat_sessions CASCADE');});
 after(async()=>{await pool?.end();if(child)spawnSync(path.join(bin,'pg_ctl.exe'),['-D',path.join(root,'data'),'stop','-m','fast','-w'],{windowsHide:true});});
 const grant=async(n='12025550101')=>service.consent(admin,{phone:n,status:'granted',categories:['UTILITY'],evidence:'Synthetic explicit permission'});
+test('bulk consent deduplicates, audits actual updates and never restores previous opt-out',async()=>{
+ await service.consent(admin,{phone:'12025550102',status:'withdrawn',categories:['UTILITY'],evidence:'Synthetic opt-out'});
+ const result=await service.bulkConsent(admin,{phones:['+12025550101','12025550101','12025550102'],status:'granted',categories:['UTILITY','MARKETING'],evidence:'Synthetic documented group consent'});
+ assert.equal(result.total,2);assert.equal(result.updated,1);assert.equal(result.skippedWithdrawn,1);assert.equal(result.permissions.find(r=>r.phone==='12025550102').status,'withdrawn');
+ assert.deepEqual((await pool.query('SELECT phone,status FROM whatsapp_contact_permission_audit ORDER BY id')).rows,[{phone:'12025550102',status:'withdrawn'},{phone:'12025550101',status:'granted'}]);
+ const d=await service.prepare(admin,body([row(),row('12025550102')]),randomUUID());assert.equal(d.eligible,1);assert.equal(d.recipients[1].reason,'OPTED_OUT');
+ await service.bulkConsent(admin,{phones:['12025550101','12025550102'],status:'withdrawn',categories:['UTILITY'],evidence:'Synthetic group exclusion'});
+ assert.equal((await service.prepare(admin,body(),randomUUID())).eligible,0);assert.equal((await pool.query('SELECT count(*)::int AS n FROM dashboard_send_queue')).rows[0].n,0);
+});
+test('bulk consent validates all recipients/evidence/permissions before writing and rolls back audit failure',async()=>{
+ for(const change of [{phones:[]},{phones:['fb:12025550101']},{categories:[]},{evidence:'x'}])await assert.rejects(service.bulkConsent(admin,{phones:['12025550101'],status:'granted',categories:['UTILITY'],evidence:'Synthetic evidence',...change}));
+ await assert.rejects(service.bulkConsent({username:'agent',role:'admin'},{phones:['12025550101']}),/ADMINS_ONLY/);
+ const denied=new Campaigns({...service,canAccess:async()=>false});await assert.rejects(denied.bulkConsent(admin,{phones:['12025550101'],status:'granted',categories:['UTILITY'],evidence:'Synthetic evidence'}),/ACCESS_DENIED/);
+ await pool.query("CREATE FUNCTION synthetic_fail_bulk_audit() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''synthetic audit failure''; END'; CREATE TRIGGER synthetic_fail_bulk BEFORE INSERT ON whatsapp_contact_permission_audit FOR EACH STATEMENT EXECUTE FUNCTION synthetic_fail_bulk_audit();");
+ try{await assert.rejects(service.bulkConsent(admin,{phones:['12025550101','12025550102'],status:'granted',categories:['UTILITY'],evidence:'Synthetic evidence'}));assert.equal((await pool.query('SELECT count(*)::int AS n FROM whatsapp_contact_permissions')).rows[0].n,0);}finally{await pool.query('DROP TRIGGER synthetic_fail_bulk ON whatsapp_contact_permission_audit;DROP FUNCTION synthetic_fail_bulk_audit()');}
+});
+test('concurrent bulk grant and withdrawal remain opted out and never enqueue a message',async()=>{
+ const b={phones:['12025550101'],categories:['UTILITY'],evidence:'Synthetic concurrent evidence'};
+ await Promise.all([service.bulkConsent(admin,{...b,status:'granted'}),service.bulkConsent(admin,{...b,status:'withdrawn'})]);
+ assert.equal((await service.permissions(b.phones)).get(b.phones[0]).status,'withdrawn');assert.equal((await pool.query('SELECT count(*)::int AS n FROM dashboard_send_queue')).rows[0].n,0);
+});
 test('limited test: concurrent API preparations admit one campaign only; stable retry reuses it',async()=>{
  const limited=new Campaigns({...service,env:{...service.env,WHATSAPP_CAMPAIGNS_TEST_MODE:undefined}});await grant('201114438440');
  await assert.rejects(limited.prepare(admin,body(),randomUUID()),/CAMPAIGN_TEST_RECIPIENT_ONLY/);
