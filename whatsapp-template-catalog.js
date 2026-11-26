@@ -39,6 +39,15 @@ function normalizeTemplate(source) {
     !/^[a-zA-Z]{2,3}(?:_[a-zA-Z0-9]{2,8})?$/.test(source.language||'') || !Array.isArray(source.components))
     throw new CatalogError('META_INVALID_TEMPLATE',502);
   const components=source.components.map(item=>sanitizeComponent(item));
+  // Keep only bounded HEADER sample URLs, separate from the canonical revision.
+  // Meta upload handles are not message Media IDs. Never expose other examples.
+  const mediaSamples={};
+  source.components.forEach((c,i)=>{
+    if(c.type==='HEADER'&&['IMAGE','VIDEO','DOCUMENT'].includes(c.format)){
+      const samples=source.mediaSamples?.[i]||c.example?.header_handle;
+      if(Array.isArray(samples))mediaSamples[i]=samples.filter(v=>typeof v==='string'&&v.length<=4096&&/^https:\/\//.test(v)).slice(0,3);
+    }
+  });
   const variables=[],requirements=[],warnings=[];
   function visit(component,path) {
     for(const field of ['text','url']) {
@@ -59,7 +68,7 @@ function normalizeTemplate(source) {
   if(variables.length>100)throw new CatalogError('META_TOO_MANY_VARIABLES',502);
   return {id:source.id,name:source.name,language:source.language,status:'APPROVED',
     category:String(source.category||'UNKNOWN').slice(0,80),parameterFormat:source.parameter_format||'POSITIONAL',
-    components,variables,requirements,warnings};
+    components,variables,requirements,warnings,...(Object.keys(mediaSamples).length?{mediaSamples}:{})};
 }
 function createTemplateCatalog({env=process.env,fetchImpl=global.fetch,now=()=>Date.now(),ttlMs=120000}={}) {
   let cache=null,pending=null;
@@ -110,7 +119,7 @@ function registerTemplateCatalog(app,{requireAuth,requireConversationRole,catalo
     res.set('Cache-Control','no-store');
     try {
       const data=await catalog.list();
-      data.templates=data.templates.map(t=>({...t,revision:templateRevision(t),sendSchema:templateTools().plan(t)}));
+      data.templates=data.templates.map(t=>{const {mediaSamples,...publicTemplate}=t;return {...publicTemplate,revision:templateRevision(t),sendSchema:templateTools().plan(t)};});
       data.dynamicSendingEnabled=dynamicEnabled();res.json(data);
     }
     catch(error) {

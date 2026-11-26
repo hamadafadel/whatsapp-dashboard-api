@@ -5,6 +5,7 @@ const {PgSendQueueStore, SendQueue, fault: sendQueueFault} = require('./send-que
 const {PgAndroidPushStore} = require('./android-push-store');
 const {createAndroidPushService,registerAndroidPushRoutes} = require('./android-push');
 const {registerTemplateCatalog,createTemplateCatalog} = require('./whatsapp-template-catalog');
+const {TemplateMedia,registerTemplateMedia}=require('./whatsapp-template-media');
 const {createDynamicTemplates,registerDynamicTemplates} = require('./whatsapp-template-send');
 const {Campaigns,registerCampaigns} = require('./whatsapp-campaigns');
 const {StatusInbox}=require('./whatsapp-template-status-inbox');
@@ -3233,6 +3234,7 @@ app.post('/api/meta-purchase', requireAuth, requireConversationAccess(), async (
 // تيمبليتات الواتس المعتمدة (بره فترة الـ 24 ساعة). templateName/language لازم
 // تطابق بالظبط اسم التيمبليت المسجّل ومعتمد في WhatsApp Business Manager
 const whatsappTemplateCatalog=createTemplateCatalog();
+registerTemplateMedia(app,{service:new TemplateMedia({pool,catalog:whatsappTemplateCatalog}),requireAuth,requireConversationRole,requireAdmin,multer});
 const dynamicWhatsappTemplates=createDynamicTemplates({catalog:whatsappTemplateCatalog});
 registerTemplateCatalog(app,{requireAuth,requireConversationRole,catalog:whatsappTemplateCatalog,dynamicEnabled:()=>dynamicWhatsappTemplates.enabled()});
 registerDynamicTemplates(app,{requireAuth,requireConversationAccess,service:dynamicWhatsappTemplates,accept:acceptDurableSend});

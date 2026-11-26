@@ -22,6 +22,7 @@ before(async()=>{
  // Existing production indexes are part of the baseline, not a new campaign migration.
  await pool.query("CREATE INDEX idx_chat_memory_session_id_id_desc ON chat_memory(session_id,id DESC);CREATE INDEX idx_chat_memory_customer_name_session_id_desc ON chat_memory(session_id,id DESC) WHERE COALESCE(message->>'customer_name','')<>'';CREATE INDEX idx_chat_memory_user_session_id_desc ON chat_memory(session_id,id DESC) WHERE message->>'type'='user';");
  await pool.query(fs.readFileSync(path.join(__dirname,'../whatsapp_campaigns.sql'),'utf8'));store=new PgSendQueueStore(pool);
+ await pool.query(fs.readFileSync(path.join(__dirname,'../whatsapp-template-media.sql'),'utf8'));
  service=new Campaigns({pool,catalog:{list:async()=>({templates:[t]})},dynamic:{enabled:()=>true},queueStore:store,account:n=>n===admin.username?admin:null,canAccess:async(u,s)=>u?.role==='admin',env:{WHATSAPP_CAMPAIGNS_TEST_MODE:'false',WHATSAPP_CAMPAIGNS_ENABLED:'true',WHATSAPP_CAMPAIGNS_WORKER_ENABLED:'true',WHATSAPP_PHONE_NUMBER_ID:'12345'}});
 });
 beforeEach(async()=>{await pool.query('TRUNCATE whatsapp_template_campaign_recipients,whatsapp_template_campaigns,whatsapp_contact_permissions,whatsapp_contact_permission_audit,whatsapp_template_delivery_events,whatsapp_template_status_inbox,dashboard_send_queue,dashboard_send_queue_sessions,conversation_label_assignments,conversation_labels,chat_memory,chat_sessions CASCADE');});
@@ -42,6 +43,31 @@ test('bulk consent validates all recipients/evidence/permissions before writing 
  const denied=new Campaigns({...service,canAccess:async()=>false});await assert.rejects(denied.bulkConsent(admin,{phones:['12025550101'],status:'granted',categories:['UTILITY'],evidence:'Synthetic evidence'}),/ACCESS_DENIED/);
  await pool.query("CREATE FUNCTION synthetic_fail_bulk_audit() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE EXCEPTION ''synthetic audit failure''; END'; CREATE TRIGGER synthetic_fail_bulk BEFORE INSERT ON whatsapp_contact_permission_audit FOR EACH STATEMENT EXECUTE FUNCTION synthetic_fail_bulk_audit();");
  try{await assert.rejects(service.bulkConsent(admin,{phones:['12025550101','12025550102'],status:'granted',categories:['UTILITY'],evidence:'Synthetic evidence'}));assert.equal((await pool.query('SELECT count(*)::int AS n FROM whatsapp_contact_permissions')).rows[0].n,0);}finally{await pool.query('DROP TRIGGER synthetic_fail_bulk ON whatsapp_contact_permission_audit;DROP FUNCTION synthetic_fail_bulk_audit()');}
+});
+test('template media is durable, language/ID-scoped, immutable on replacement and compiles unchanged send payloads',async()=>{
+ const {TemplateMedia}=require('../whatsapp-template-media'),{templateTools}=require('../whatsapp-template-payload');
+ const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a2ioAAAAASUVORK5CYII=','base64');
+ const definition={...t,id:'900001',components:[{type:'HEADER',format:'IMAGE'},{type:'BODY',text:'أهلا'}]},revision=templateRevision(definition);
+ const catalog={list:async()=>({templates:[definition,{...definition,language:'en_US'},{...definition,id:'900002'}]})};
+ const media=new TemplateMedia({pool,catalog}),first=await media.save(definition.id,'ar',revision,png,admin.username);
+ const saved=(await media.get(definition.id,'ar')).media;assert.equal(saved.url,first.media.url);
+ assert.equal((await media.get(definition.id,'en_US')).media,null);assert.equal((await media.get('900002','ar')).media,null);
+ const frozen={'components[0].media':'https://api.example.test'+first.media.url},second=await media.save(definition.id,'ar',revision,png,admin.username);
+ assert.notEqual(second.media.url,first.media.url);assert.equal((await media.get(definition.id,'ar')).media.url,second.media.url);
+ const old=(await pool.query('SELECT content FROM whatsapp_template_media_files WHERE id=$1',[first.media.url.split('/').pop()])).rows[0];assert.deepEqual(old.content,png);
+ assert.equal(templateTools().compile(definition,frozen).components[0].parameters[0].image.link,frozen['components[0].media']);
+ const restarted=new TemplateMedia({pool,catalog});assert.equal((await restarted.get(definition.id,'ar')).media.url,second.media.url);
+ assert.equal((await pool.query('SELECT count(*)::int AS n FROM dashboard_send_queue')).rows[0].n,0);
+});
+test('concurrent Meta sample import cannot overwrite a device upload; DB media constraints and migration reapplication hold',async()=>{
+ const {TemplateMedia}=require('../whatsapp-template-media');const bytes=Buffer.from('%PDF-1.7\nSynthetic document');
+ const definition={...t,id:'900003',components:[{type:'HEADER',format:'DOCUMENT'}],mediaSamples:{0:['https://s.fbcdn.net/file']}},revision=templateRevision(definition),catalog={list:async()=>({templates:[definition]})};
+ const media=new TemplateMedia({pool,catalog,download:async()=>bytes}),uploaded=await media.save(definition.id,'ar',revision,bytes,admin.username);
+ const imports=await Promise.all([media.importSample(definition.id,'ar',revision,admin.username),media.importSample(definition.id,'ar',revision,admin.username)]);
+ assert(imports.every(v=>v.media.url===uploaded.media.url));
+ await assert.rejects(pool.query(`INSERT INTO whatsapp_template_media_defaults(template_id,language,format,file_id) VALUES('900004','ar','VIDEO',$1)`,[uploaded.media.url.split('/').pop()]));
+ await pool.query(fs.readFileSync(path.join(__dirname,'../whatsapp-template-media.sql'),'utf8'));
+ assert.equal((await media.get(definition.id,'ar')).media.url,uploaded.media.url);
 });
 test('concurrent bulk grant and withdrawal remain opted out and never enqueue a message',async()=>{
  const b={phones:['12025550101'],categories:['UTILITY'],evidence:'Synthetic concurrent evidence'};
